@@ -1,6 +1,11 @@
-.loom/loom.db
-.loom/blobs/
-.loom/memory/
+# Loom runtime data (parquet files, sessions)
+.loom/
+
+# Clojure build artifacts
 .cpcache/
 target/
 *.class
+
+# IDE/LSP artifacts
+.clj-kondo/
+.lsp/

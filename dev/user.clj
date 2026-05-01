@@ -1,5 +1,6 @@
 (ns user
-  "Auto-start loom when the REPL boots."
+  "REPL utilities. Loom should be started via OpenCode commands (/loom-init, /start-loom)."
   (:require [dev]))
 
-(dev/start!)
+;; Loom is started via OpenCode commands, not automatically.
+;; To start manually from REPL: (dev/start!)
