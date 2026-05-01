@@ -1,0 +1,22 @@
+(ns loom.session
+  "Per-session fact logging (tier-2 memory) stored in session parquet."
+  (:require [loom.db :as db]
+            [loom.embedder :as embedder]
+            [loom.envelope :refer [with-provenance unwrap!]]))
+
+(defn log-fact!
+  "Log a working observation to the session facts parquet."
+  [ctx content]
+  (with-provenance "loom.session/log-fact!" 1
+    (let [vec (unwrap! (embedder/embed ctx content))]
+      (unwrap! (db/save-session-fact! ctx
+                 {:content  content
+                  :vector   vec
+                  :agent-id (get-in ctx [:agent :id])})))))
+
+(defn search-facts
+  "Semantic search within current session facts only."
+  [ctx query k]
+  (with-provenance "loom.session/search-facts" 1
+    (let [vec (unwrap! (embedder/embed ctx query))]
+      (unwrap! (db/search-session-facts ctx vec k)))))

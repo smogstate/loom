@@ -1,0 +1,6 @@
+.loom/loom.db
+.loom/blobs/
+.loom/memory/
+.cpcache/
+target/
+*.class

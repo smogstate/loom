@@ -1,0 +1,691 @@
+(ns loom.db
+  "DuckDB-backed Parquet store.
+   Global data lives in <loom-dir>/{tools,facts,events,chunks}.parquet.
+   Session data lives in <loom-dir>/sessions/<session-id>/{tools,facts,hits}.parquet.
+   One persistent DuckDBConnection per context — in-memory, no .db file."
+  (:require [clojure.string :as str]
+            [clojure.java.io :as io]
+            [cheshire.core :as json]
+            [clojure.core.async :as async]
+            [loom.envelope :refer [with-provenance]])
+  (:import [org.duckdb DuckDBConnection]
+           [java.sql DriverManager ResultSet]))
+
+;; ---------------------------------------------------------------------------
+;; Connection
+;; ---------------------------------------------------------------------------
+
+(defn connect!
+  "Open an in-memory DuckDB connection. Returns a java.sql.Connection."
+  []
+  (Class/forName "org.duckdb.DuckDBDriver")
+  (DriverManager/getConnection "jdbc:duckdb:"))
+
+;; ---------------------------------------------------------------------------
+;; Single-writer queue
+;; ---------------------------------------------------------------------------
+
+(defonce ^:private write-ch (async/chan 256))
+(defonce ^:private writer-started? (atom false))
+
+(defn start-writer!
+  "Start the serialized write loop. Idempotent."
+  []
+  (when (compare-and-set! writer-started? false true)
+    (async/go-loop []
+      (when-let [{:keys [f result-ch]} (async/<! write-ch)]
+        (let [result (try (f) (catch Exception e e))]
+          (when result-ch (async/>! result-ch result)))
+        (recur)))))
+
+(defn- write!
+  "Serialize a thunk through the write queue. Blocks caller until done."
+  [f]
+  (let [result-ch (async/promise-chan)]
+    (async/>!! write-ch {:f f :result-ch result-ch})
+    (let [r (async/<!! result-ch)]
+      (if (instance? Exception r) (throw r) r))))
+
+;; ---------------------------------------------------------------------------
+;; Low-level SQL helpers
+;; ---------------------------------------------------------------------------
+
+(defn- exec!
+  "Execute a SQL statement on conn. Returns update count."
+  [^java.sql.Connection conn sql & params]
+  (let [ps (.prepareStatement conn sql)]
+    (doseq [[i p] (map-indexed vector params)]
+      (.setObject ps (inc i) p))
+    (.executeUpdate ps)))
+
+(defn- query
+  "Execute a SELECT and return rows as vec of maps."
+  [^java.sql.Connection conn sql & params]
+  (let [ps  (.prepareStatement conn sql)
+        _   (doseq [[i p] (map-indexed vector params)]
+              (.setObject ps (inc i) p))
+        rs  (.executeQuery ps)
+        md  (.getMetaData rs)
+        n   (.getColumnCount md)
+        cols (mapv #(.getColumnLabel md (inc %)) (range n))]
+    (loop [rows []]
+      (if (.next rs)
+        (recur (conj rows (into {} (map (fn [c] [(keyword (str/lower-case c))
+                                                 (.getObject rs c)]) cols))))
+        rows))))
+
+(defn- uuid [] (str (java.util.UUID/randomUUID)))
+
+;; ---------------------------------------------------------------------------
+;; Parquet path helpers
+;; ---------------------------------------------------------------------------
+
+(defn- ensure-dir! [path]
+  (.mkdirs (io/file path)))
+
+(defn parquet-path
+  "Absolute path to a global parquet file."
+  [loom-dir table]
+  (str loom-dir "/" (name table) ".parquet"))
+
+(defn session-parquet-path
+  "Absolute path to a session-scoped parquet file."
+  [loom-dir session-id table]
+  (str loom-dir "/sessions/" session-id "/" (name table) ".parquet"))
+
+;; ---------------------------------------------------------------------------
+;; Parquet read/write primitives
+;;
+;; Strategy: load parquet into a temp in-memory table, mutate, COPY back out.
+;; read_parquet() is used directly for queries — no temp table needed.
+;; ---------------------------------------------------------------------------
+
+(defn- float-vec->sql
+  "Serialize a float vector as a DuckDB array literal."
+  [v]
+  (when v (str "[" (str/join ", " (map float v)) "]")))
+
+(defn- parse-float-vec [v]
+  (when v
+    (cond
+      (instance? java.sql.Array v) (vec (.getArray v))
+      (string? v) (mapv #(Float/parseFloat (str/trim %))
+                        (-> (str v)
+                            (str/replace #"^\[|\]$" "")
+                            (str/split #",")))
+      :else (vec v))))
+
+(defn- parse-json [v]
+  (when v (json/parse-string (str v) true)))
+
+;; ---------------------------------------------------------------------------
+;; Tools — global
+;; ---------------------------------------------------------------------------
+
+(def ^:private tools-ddl
+  "CREATE TABLE IF NOT EXISTS tools (
+     id         VARCHAR PRIMARY KEY,
+     name       VARCHAR,
+     doc        VARCHAR,
+     tags       VARCHAR,
+     vector     VARCHAR,
+     code       VARCHAR,
+     version    INTEGER DEFAULT 1,
+     supersedes VARCHAR,
+     retired    BOOLEAN DEFAULT false,
+     created_at TIMESTAMP DEFAULT now()
+   )")
+
+(defn- load-tools-table!
+  "Load global tools parquet into in-memory table (creates empty if no file)."
+  [conn path]
+  (exec! conn "DROP TABLE IF EXISTS tools")
+  (exec! conn tools-ddl)
+  (when (.exists (io/file path))
+    (exec! conn (str "INSERT INTO tools SELECT * FROM read_parquet('" path "')"))))
+
+(defn- flush-tools!
+  "Write in-memory tools table back to parquet."
+  [conn path]
+  (ensure-dir! (.getParent (io/file path)))
+  (exec! conn (str "COPY tools TO '" path "' (FORMAT PARQUET)")))
+
+(defn save-tool!
+  "Insert or update a tool in the global parquet. Returns envelope with tool id."
+  [ctx tool]
+  (with-provenance "loom.db/save-tool!" 1
+    (write!
+      (fn []
+        (let [conn  (:conn ctx)
+              path  (parquet-path (get-in ctx [:config :loom-dir]) :tools)
+              id    (or (:id tool) (uuid))
+              tags  (json/encode (or (:tags tool) []))
+              vec-s (float-vec->sql (:vector tool))]
+          (load-tools-table! conn path)
+          (exec! conn "UPDATE tools SET retired = true WHERE name = ? AND retired = false" (:name tool))
+          (exec! conn
+            "INSERT INTO tools (id, name, doc, tags, vector, code, version, supersedes, retired)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, false)"
+            id (:name tool) (:doc tool) tags vec-s
+            (:code tool) (or (:version tool) 1) (:supersedes tool))
+          (flush-tools! conn path)
+          id)))))
+
+(defn search-tools
+  "Semantic search over non-retired tools. Returns top-k matches."
+  [ctx query-vec k]
+  (with-provenance "loom.db/search-tools" 1
+    (let [conn  (:conn ctx)
+          path  (parquet-path (get-in ctx [:config :loom-dir]) :tools)
+          vec-s (float-vec->sql query-vec)]
+      (load-tools-table! conn path)
+      (->> (query conn
+             (str "SELECT id, name, doc, tags, vector, code, version
+                   FROM tools
+                   WHERE retired = false
+                   ORDER BY array_distance(vector::FLOAT[768], " vec-s "::FLOAT[768])
+                   LIMIT " (int k)))
+           (mapv (fn [r] (-> r
+                             (update :tags parse-json)
+                             (update :vector parse-float-vec))))))))
+
+(defn get-tool
+  "Fetch a single non-retired tool by name."
+  [ctx name]
+  (with-provenance "loom.db/get-tool" 1
+    (let [conn (:conn ctx)
+          path (parquet-path (get-in ctx [:config :loom-dir]) :tools)]
+      (load-tools-table! conn path)
+      (some-> (first (query conn "SELECT * FROM tools WHERE name = ? AND retired = false" name))
+              (update :tags parse-json)
+              (update :vector parse-float-vec)))))
+
+(defn table-empty?
+  "True if no non-retired rows exist in the given parquet table."
+  [ctx table]
+  (with-provenance "loom.db/table-empty?" 1
+    (let [path (parquet-path (get-in ctx [:config :loom-dir]) table)]
+      (not (.exists (io/file path))))))
+
+(defn table-count
+  "Count non-retired rows in a global parquet table."
+  [ctx table]
+  (with-provenance "loom.db/table-count" 1
+    (let [conn (:conn ctx)
+          path (parquet-path (get-in ctx [:config :loom-dir]) table)]
+      (if (.exists (io/file path))
+        (-> (query conn (str "SELECT COUNT(*) AS cnt FROM read_parquet('" path "') WHERE retired = false"))
+            first :cnt)
+        0))))
+
+(defn rollback-tool!
+  "Un-retire a previous tool version; retire the current one."
+  [ctx tool-name previous-id]
+  (with-provenance "loom.db/rollback-tool!" 1
+    (write!
+      (fn []
+        (let [conn (:conn ctx)
+              path (parquet-path (get-in ctx [:config :loom-dir]) :tools)]
+          (load-tools-table! conn path)
+          (exec! conn "UPDATE tools SET retired = true  WHERE name = ? AND retired = false" tool-name)
+          (exec! conn "UPDATE tools SET retired = false WHERE id = ?" previous-id)
+          (flush-tools! conn path))))))
+
+;; ---------------------------------------------------------------------------
+;; Facts — global
+;; ---------------------------------------------------------------------------
+
+(def ^:private facts-ddl
+  "CREATE TABLE IF NOT EXISTS facts (
+     id          VARCHAR PRIMARY KEY,
+     content     VARCHAR,
+     vector      VARCHAR,
+     type        VARCHAR,
+     tags        VARCHAR,
+     promoted_by VARCHAR,
+     session_id  VARCHAR,
+     retired     BOOLEAN DEFAULT false,
+     ts          TIMESTAMP DEFAULT now()
+   )")
+
+(defn- load-facts-table! [conn path]
+  (exec! conn "DROP TABLE IF EXISTS facts")
+  (exec! conn facts-ddl)
+  (when (.exists (io/file path))
+    (exec! conn (str "INSERT INTO facts SELECT * FROM read_parquet('" path "')"))))
+
+(defn- flush-facts! [conn path]
+  (ensure-dir! (.getParent (io/file path)))
+  (exec! conn (str "COPY facts TO '" path "' (FORMAT PARQUET)")))
+
+(defn save-fact!
+  "Insert a global fact. Returns envelope with new fact id."
+  [ctx fact]
+  (with-provenance "loom.db/save-fact!" 1
+    (write!
+      (fn []
+        (let [conn  (:conn ctx)
+              path  (parquet-path (get-in ctx [:config :loom-dir]) :facts)
+              id    (or (:id fact) (uuid))
+              tags  (json/encode (or (:tags fact) []))
+              vec-s (float-vec->sql (:vector fact))]
+          (load-facts-table! conn path)
+          (exec! conn
+            "INSERT INTO facts (id, content, vector, type, tags, promoted_by, session_id)
+             VALUES (?, ?, ?, ?, ?, ?, ?)"
+            id (:content fact) vec-s (:type fact) tags
+            (:promoted-by fact) (:session-id fact))
+          (flush-facts! conn path)
+          id)))))
+
+(defn search-facts
+  "Semantic search over non-retired global facts."
+  [ctx query-vec k]
+  (with-provenance "loom.db/search-facts" 1
+    (let [conn  (:conn ctx)
+          path  (parquet-path (get-in ctx [:config :loom-dir]) :facts)
+          vec-s (float-vec->sql query-vec)]
+      (if (.exists (io/file path))
+        (->> (query conn
+               (str "SELECT id, content, type, tags, vector, promoted_by, session_id, ts
+                     FROM read_parquet('" path "')
+                     WHERE retired = false
+                     ORDER BY array_distance(vector::FLOAT[768], " vec-s "::FLOAT[768])
+                     LIMIT " (int k)))
+             (mapv (fn [r] (-> r (update :tags parse-json) (update :vector parse-float-vec)))))
+        []))))
+
+(defn retire-fact!
+  [ctx fact-id]
+  (with-provenance "loom.db/retire-fact!" 1
+    (write!
+      (fn []
+        (let [conn (:conn ctx)
+              path (parquet-path (get-in ctx [:config :loom-dir]) :facts)]
+          (load-facts-table! conn path)
+          (exec! conn "UPDATE facts SET retired = true WHERE id = ?" fact-id)
+          (flush-facts! conn path))))))
+
+;; ---------------------------------------------------------------------------
+;; Session facts — per-session parquet
+;; ---------------------------------------------------------------------------
+
+(def ^:private session-facts-ddl
+  "CREATE TABLE IF NOT EXISTS session_facts (
+     id       VARCHAR PRIMARY KEY,
+     agent_id VARCHAR,
+     content  VARCHAR,
+     vector   VARCHAR,
+     ts       TIMESTAMP DEFAULT now()
+   )")
+
+(defn- session-facts-path [ctx]
+  (session-parquet-path
+    (get-in ctx [:config :loom-dir])
+    (:session-id ctx)
+    :facts))
+
+(defn- load-session-facts! [conn path]
+  (exec! conn "DROP TABLE IF EXISTS session_facts")
+  (exec! conn session-facts-ddl)
+  (when (.exists (io/file path))
+    (exec! conn (str "INSERT INTO session_facts SELECT * FROM read_parquet('" path "')"))))
+
+(defn- flush-session-facts! [conn path]
+  (ensure-dir! (.getParent (io/file path)))
+  (exec! conn (str "COPY session_facts TO '" path "' (FORMAT PARQUET)")))
+
+(defn save-session-fact!
+  "Write a fact to the per-session parquet."
+  [ctx fact]
+  (with-provenance "loom.db/save-session-fact!" 1
+    (write!
+      (fn []
+        (let [conn  (:conn ctx)
+              path  (session-facts-path ctx)
+              id    (or (:id fact) (uuid))
+              vec-s (float-vec->sql (:vector fact))]
+          (load-session-facts! conn path)
+          (exec! conn
+            "INSERT INTO session_facts (id, agent_id, content, vector) VALUES (?, ?, ?, ?)"
+            id (:agent-id fact) (:content fact) vec-s)
+          (flush-session-facts! conn path)
+          id)))))
+
+(defn search-session-facts
+  "Semantic search within the current session facts parquet."
+  [ctx query-vec k]
+  (with-provenance "loom.db/search-session-facts" 1
+    (let [conn  (:conn ctx)
+          path  (session-facts-path ctx)
+          vec-s (float-vec->sql query-vec)]
+      (if (.exists (io/file path))
+        (->> (query conn
+               (str "SELECT id, agent_id, content, vector, ts
+                     FROM read_parquet('" path "')
+                     ORDER BY array_distance(vector::FLOAT[768], " vec-s "::FLOAT[768])
+                     LIMIT " (int k)))
+             (mapv #(update % :vector parse-float-vec)))
+        []))))
+
+;; ---------------------------------------------------------------------------
+;; Session scratch tools — per-session parquet
+;; ---------------------------------------------------------------------------
+
+(def ^:private scratch-tools-ddl
+  "CREATE TABLE IF NOT EXISTS scratch_tools (
+     id         VARCHAR PRIMARY KEY,
+     name       VARCHAR,
+     doc        VARCHAR,
+     tags       VARCHAR,
+     vector     VARCHAR,
+     code       VARCHAR,
+     file       VARCHAR,
+     retired    BOOLEAN DEFAULT false,
+     created_at TIMESTAMP DEFAULT now()
+   )")
+
+(defn- scratch-tools-path [ctx]
+  (session-parquet-path
+    (get-in ctx [:config :loom-dir])
+    (:session-id ctx)
+    :tools))
+
+(defn- load-scratch-tools! [conn path]
+  (exec! conn "DROP TABLE IF EXISTS scratch_tools")
+  (exec! conn scratch-tools-ddl)
+  (when (.exists (io/file path))
+    (exec! conn (str "INSERT INTO scratch_tools SELECT * FROM read_parquet('" path "')"))))
+
+(defn- flush-scratch-tools! [conn path]
+  (ensure-dir! (.getParent (io/file path)))
+  (exec! conn (str "COPY scratch_tools TO '" path "' (FORMAT PARQUET)")))
+
+(defn save-scratch-tool!
+  "Register a scratch tool in the session parquet."
+  [ctx tool]
+  (with-provenance "loom.db/save-scratch-tool!" 1
+    (write!
+      (fn []
+        (let [conn  (:conn ctx)
+              path  (scratch-tools-path ctx)
+              id    (or (:id tool) (uuid))
+              tags  (json/encode (or (:tags tool) []))
+              vec-s (float-vec->sql (:vector tool))]
+          (load-scratch-tools! conn path)
+          (exec! conn
+            "INSERT INTO scratch_tools (id, name, doc, tags, vector, code, file, retired)
+             VALUES (?, ?, ?, ?, ?, ?, ?, false)"
+            id (:name tool) (:doc tool) tags vec-s (:code tool) (:file tool))
+          (flush-scratch-tools! conn path)
+          id)))))
+
+(defn search-scratch-tools
+  "Semantic search over session scratch tools."
+  [ctx query-vec k]
+  (with-provenance "loom.db/search-scratch-tools" 1
+    (let [conn  (:conn ctx)
+          path  (scratch-tools-path ctx)
+          vec-s (float-vec->sql query-vec)]
+      (if (.exists (io/file path))
+        (->> (query conn
+               (str "SELECT id, name, doc, tags, vector, code, file
+                     FROM read_parquet('" path "')
+                     WHERE retired = false
+                     ORDER BY array_distance(vector::FLOAT[768], " vec-s "::FLOAT[768])
+                     LIMIT " (int k)))
+             (mapv (fn [r] (-> r (update :tags parse-json) (update :vector parse-float-vec)))))
+        []))))
+
+(defn get-scratch-tool
+  "Fetch a single scratch tool by name."
+  [ctx name]
+  (with-provenance "loom.db/get-scratch-tool" 1
+    (let [conn (:conn ctx)
+          path (scratch-tools-path ctx)]
+      (when (.exists (io/file path))
+        (some-> (first (query conn
+                  (str "SELECT * FROM read_parquet('" path "')
+                        WHERE name = ? AND retired = false") name))
+                (update :tags parse-json)
+                (update :vector parse-float-vec))))))
+
+;; ---------------------------------------------------------------------------
+;; Session hit counts — per-session parquet
+;; ---------------------------------------------------------------------------
+
+(def ^:private hits-ddl
+  "CREATE TABLE IF NOT EXISTS hits (
+     tool_name VARCHAR PRIMARY KEY,
+     count     INTEGER DEFAULT 0
+   )")
+
+(defn- hits-path [ctx]
+  (session-parquet-path
+    (get-in ctx [:config :loom-dir])
+    (:session-id ctx)
+    :hits))
+
+(defn- load-hits! [conn path]
+  (exec! conn "DROP TABLE IF EXISTS hits")
+  (exec! conn hits-ddl)
+  (when (.exists (io/file path))
+    (exec! conn (str "INSERT INTO hits SELECT * FROM read_parquet('" path "')"))))
+
+(defn- flush-hits! [conn path]
+  (ensure-dir! (.getParent (io/file path)))
+  (exec! conn (str "COPY hits TO '" path "' (FORMAT PARQUET)")))
+
+(defn inc-hit!
+  "Increment the session hit count for a scratch tool. Returns new count."
+  [ctx tool-name]
+  (with-provenance "loom.db/inc-hit!" 1
+    (write!
+      (fn []
+        (let [conn (:conn ctx)
+              path (hits-path ctx)]
+          (load-hits! conn path)
+          (let [existing (first (query conn "SELECT count FROM hits WHERE tool_name = ?" tool-name))]
+            (if existing
+              (exec! conn "UPDATE hits SET count = count + 1 WHERE tool_name = ?" tool-name)
+              (exec! conn "INSERT INTO hits (tool_name, count) VALUES (?, 1)" tool-name)))
+          (flush-hits! conn path)
+          (-> (query conn "SELECT count FROM hits WHERE tool_name = ?" tool-name)
+              first :count))))))
+
+(defn get-hit-count
+  "Get the session hit count for a scratch tool."
+  [ctx tool-name]
+  (with-provenance "loom.db/get-hit-count" 1
+    (let [conn (:conn ctx)
+          path (hits-path ctx)]
+      (if (.exists (io/file path))
+        (or (-> (query conn
+                  (str "SELECT count FROM read_parquet('" path "') WHERE tool_name = ?")
+                  tool-name)
+                first :count)
+            0)
+        0))))
+
+;; ---------------------------------------------------------------------------
+;; Events — global
+;; ---------------------------------------------------------------------------
+
+(def ^:private events-ddl
+  "CREATE TABLE IF NOT EXISTS events (
+     id         VARCHAR PRIMARY KEY,
+     session_id VARCHAR,
+     agent_id   VARCHAR,
+     type       VARCHAR,
+     vector     VARCHAR,
+     content    VARCHAR,
+     provenance VARCHAR,
+     ts         TIMESTAMP DEFAULT now()
+   )")
+
+(defn- load-events-table! [conn path]
+  (exec! conn "DROP TABLE IF EXISTS events")
+  (exec! conn events-ddl)
+  (when (.exists (io/file path))
+    (exec! conn (str "INSERT INTO events SELECT * FROM read_parquet('" path "')"))))
+
+(defn- flush-events! [conn path]
+  (ensure-dir! (.getParent (io/file path)))
+  (exec! conn (str "COPY events TO '" path "' (FORMAT PARQUET)")))
+
+(defn log-event!
+  "Append a structural event with provenance."
+  [ctx event]
+  (with-provenance "loom.db/log-event!" 1
+    (write!
+      (fn []
+        (let [conn  (:conn ctx)
+              path  (parquet-path (get-in ctx [:config :loom-dir]) :events)
+              id    (or (:id event) (uuid))
+              vec-s (float-vec->sql (:vector event))
+              prov  (json/encode (or (:provenance event) {}))]
+          (load-events-table! conn path)
+          (exec! conn
+            "INSERT INTO events (id, session_id, agent_id, type, vector, content, provenance)
+             VALUES (?, ?, ?, ?, ?, ?, ?)"
+            id (:session-id event) (:agent-id event) (:type event)
+            vec-s (:content event) prov)
+          (flush-events! conn path)
+          id)))))
+
+(defn search-events
+  "Semantic search over events."
+  [ctx query-vec k]
+  (with-provenance "loom.db/search-events" 1
+    (let [conn  (:conn ctx)
+          path  (parquet-path (get-in ctx [:config :loom-dir]) :events)
+          vec-s (float-vec->sql query-vec)]
+      (if (.exists (io/file path))
+        (->> (query conn
+               (str "SELECT id, session_id, agent_id, type, vector, content, provenance, ts
+                     FROM read_parquet('" path "')
+                     ORDER BY array_distance(vector::FLOAT[768], " vec-s "::FLOAT[768])
+                     LIMIT " (int k)))
+             (mapv (fn [r] (-> r
+                               (update :provenance parse-json)
+                               (update :vector parse-float-vec)))))
+        []))))
+
+;; ---------------------------------------------------------------------------
+;; Chunks — global
+;; ---------------------------------------------------------------------------
+
+(def ^:private chunks-ddl
+  "CREATE TABLE IF NOT EXISTS chunks (
+     id           VARCHAR PRIMARY KEY,
+     blob_id      VARCHAR,
+     chunk_offset INTEGER,
+     vector       VARCHAR,
+     summary      VARCHAR,
+     content      VARCHAR
+   )")
+
+(defn- load-chunks-table! [conn path]
+  (exec! conn "DROP TABLE IF EXISTS chunks")
+  (exec! conn chunks-ddl)
+  (when (.exists (io/file path))
+    (exec! conn (str "INSERT INTO chunks SELECT * FROM read_parquet('" path "')"))))
+
+(defn- flush-chunks! [conn path]
+  (ensure-dir! (.getParent (io/file path)))
+  (exec! conn (str "COPY chunks TO '" path "' (FORMAT PARQUET)")))
+
+(defn save-chunk!
+  "Store a chunk record."
+  [ctx chunk]
+  (with-provenance "loom.db/save-chunk!" 1
+    (write!
+      (fn []
+        (let [conn  (:conn ctx)
+              path  (parquet-path (get-in ctx [:config :loom-dir]) :chunks)
+              id    (or (:id chunk) (uuid))
+              vec-s (float-vec->sql (:vector chunk))]
+          (load-chunks-table! conn path)
+          (exec! conn
+            "INSERT INTO chunks (id, blob_id, chunk_offset, vector, summary, content)
+             VALUES (?, ?, ?, ?, ?, ?)"
+            id (:blob-id chunk) (:offset chunk) vec-s (:summary chunk) (:content chunk))
+          (flush-chunks! conn path)
+          id)))))
+
+(defn search-chunks
+  "Semantic search over blob chunks."
+  [ctx query-vec k]
+  (with-provenance "loom.db/search-chunks" 1
+    (let [conn  (:conn ctx)
+          path  (parquet-path (get-in ctx [:config :loom-dir]) :chunks)
+          vec-s (float-vec->sql query-vec)]
+      (if (.exists (io/file path))
+        (query conn
+          (str "SELECT c.id, c.blob_id, c.chunk_offset, c.vector, c.summary, c.content
+                FROM read_parquet('" path "') c
+                ORDER BY array_distance(c.vector::FLOAT[768], " vec-s "::FLOAT[768])
+                LIMIT " (int k)))
+        []))))
+
+(defn completed-offsets
+  "Return set of already-processed chunk offsets for a blob."
+  [ctx blob-id]
+  (with-provenance "loom.db/completed-offsets" 1
+    (let [conn (:conn ctx)
+          path (parquet-path (get-in ctx [:config :loom-dir]) :chunks)]
+      (if (.exists (io/file path))
+        (->> (query conn
+               (str "SELECT chunk_offset FROM read_parquet('" path "') WHERE blob_id = ?")
+               blob-id)
+             (map :chunk_offset)
+             set)
+        #{}))))
+
+;; ---------------------------------------------------------------------------
+;; Blobs — global
+;; ---------------------------------------------------------------------------
+
+(def ^:private blobs-ddl
+  "CREATE TABLE IF NOT EXISTS blobs (
+     id         VARCHAR PRIMARY KEY,
+     path       VARCHAR,
+     source     VARCHAR,
+     agent_id   VARCHAR,
+     size_bytes BIGINT,
+     ts         TIMESTAMP DEFAULT now()
+   )")
+
+(defn- load-blobs-table! [conn path]
+  (exec! conn "DROP TABLE IF EXISTS blobs")
+  (exec! conn blobs-ddl)
+  (when (.exists (io/file path))
+    (exec! conn (str "INSERT INTO blobs SELECT * FROM read_parquet('" path "')"))))
+
+(defn- flush-blobs! [conn path]
+  (ensure-dir! (.getParent (io/file path)))
+  (exec! conn (str "COPY blobs TO '" path "' (FORMAT PARQUET)")))
+
+(defn save-blob!
+  "Index blob metadata."
+  [ctx blob]
+  (with-provenance "loom.db/save-blob!" 1
+    (write!
+      (fn []
+        (let [conn (:conn ctx)
+              path (parquet-path (get-in ctx [:config :loom-dir]) :blobs)]
+          (load-blobs-table! conn path)
+          (exec! conn
+            "INSERT INTO blobs (id, path, source, agent_id, size_bytes) VALUES (?, ?, ?, ?, ?)"
+            (:id blob) (:path blob) (:source blob) (:agent-id blob) (:size-bytes blob))
+          (flush-blobs! conn path)
+          (:id blob))))))
+
+(defn get-blob [ctx blob-id]
+  (with-provenance "loom.db/get-blob" 1
+    (let [conn (:conn ctx)
+          path (parquet-path (get-in ctx [:config :loom-dir]) :blobs)]
+      (when (.exists (io/file path))
+        (first (query conn
+                 (str "SELECT * FROM read_parquet('" path "') WHERE id = ?")
+                 blob-id))))))
