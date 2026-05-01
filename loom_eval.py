@@ -52,7 +52,10 @@ def nrepl_eval(code, port=7888, timeout=30):
         errors.append(raw[start:start+length])
 
     if result_parts:
-        return '\n'.join(result_parts)
+        result = '\n'.join(result_parts)
+        # Strip :vector [...] fields to avoid walls of floats
+        result = re.sub(r',?\s*:vector\s*\[[^\]]*\]', '', result)
+        return result
     elif errors:
         return 'ERROR: ' + '\n'.join(errors)
     return raw
