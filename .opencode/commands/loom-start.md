@@ -46,7 +46,7 @@ sleep 5 && tmux capture-pane -t loom -p | tail -10
 Test the nREPL connection:
 
 ```bash
-cd /home/denis/Projects/loom && python3 loom_eval.py "(+ 1 2)"
+(cd /home/denis/Projects/loom && python3 loom_eval.py "(+ 1 2)")
 ```
 
 Should output `3`.

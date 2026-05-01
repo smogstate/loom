@@ -19,7 +19,7 @@ External agent (OpenCode / human at REPL)
   │  nREPL :7888
   ▼
 loom.core/start!
-  ├── loom.db          — DuckDB: tools, facts, events, session facts, blobs
+  ├── loom.db          — DuckDB engine over parquet files (.loom/tools.parquet, chunks.parquet, sessions/)
   ├── loom.embedder    — Ollama nomic-embed-text (768-dim)
   ├── loom.tools       — register!, scan-ns!, search
   ├── loom.session     — per-session fact logging (tier 2 memory)
@@ -68,10 +68,9 @@ Or start programmatically from another process:
 ### Options
 
 ```clojure
-(loom/start! {:db-path    ".loom/loom.db"      ; default
-              :loom-dir   ".loom"               ; default
-              :ollama-url "http://localhost:11434"  ; default
-              :session-id "my-session"})        ; optional, auto-generated if omitted
+(loom/start! {:loom-dir   ".loom"                    ; default — parquet files stored here
+              :ollama-url "http://localhost:11434"    ; default
+              :session-id "my-session"})              ; optional, auto-generated if omitted
 ```
 
 ---
@@ -131,14 +130,16 @@ Connect to nREPL on port 7888, then:
 
 ## Agent personas
 
-Pre-written agent personas for OpenCode are in `.opencode/agents/` (canonical) and mirrored to `agents/` for reference:
+Pre-written agent personas for OpenCode live in `.opencode/agents/` in the workspace root (not inside the loom repo). They are versioned here in `loom/.opencode/agents/` as the canonical source of truth.
 
 | File | Role |
 |---|---|
-| `router.md` | Classifies tasks, dispatches to other agents |
+| `loom.md` | Orchestrator — classifies tasks, dispatches to subagents |
 | `finder.md` | Pure retrieval — search, fetch, list |
 | `analyzer.md` | Reasoning, tool creation, pattern promotion |
 | `reviewer.md` | Quality assurance, approval/rejection |
+
+Use `/loom-sync` to propagate changes from `loom/.opencode/` to the workspace `Projects/.opencode/`.
 
 ---
 
@@ -173,10 +174,12 @@ src/loom/
   state.clj      — in-process atom tool registry
   tools.clj      — register!, scan-ns!, start-watcher!
   blob.clj       — ingest!, chunk!, embed documents
+  init.clj       — index project source files (idempotent)
+  scratch.clj    — session-scoped tool creation & promotion
   repl.clj       — nREPL server start!/stop!
   seed/          — built-in tool libraries (http, fs, text, data, math, db, project)
-  agents/        — agent impl stubs (reserved for future use)
 
-agents/          — agent persona prompts for OpenCode
+.opencode/       — OpenCode integration (agents, commands, skills) — canonical source of truth
+loom_eval.py     — minimal Python nREPL client (strips :vector fields for readability)
 test/loom/       — unit tests
 ```
