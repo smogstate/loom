@@ -764,3 +764,135 @@
         (first (query conn
                  (str "SELECT * FROM read_parquet('" path "') WHERE id = ?")
                  blob-id))))))
+
+;; ---------------------------------------------------------------------------
+;; Goals — global
+;; ---------------------------------------------------------------------------
+
+(def ^:private goals-ddl
+  "CREATE TABLE IF NOT EXISTS goals (
+     id               VARCHAR PRIMARY KEY,
+     session_id       VARCHAR,
+     parent_id        VARCHAR,
+     title            VARCHAR,
+     description      VARCHAR,
+     success_criteria VARCHAR,
+     status           VARCHAR DEFAULT 'open',
+     vector           VARCHAR,
+     created_at       TIMESTAMP DEFAULT now(),
+     updated_at       TIMESTAMP DEFAULT now()
+   )")
+
+(def ^:private valid-statuses
+  #{"open" "active" "blocked" "done" "abandoned"})
+
+(defn- load-goals-table! [conn path]
+  (exec! conn "DROP TABLE IF EXISTS goals")
+  (exec! conn goals-ddl)
+  (when (.exists (io/file path))
+    (exec! conn (str "INSERT INTO goals SELECT id, session_id, parent_id, title, description,
+                                               success_criteria, status, vector, created_at, updated_at
+                      FROM read_parquet('" path "')"))))
+
+(defn- flush-goals! [conn path]
+  (ensure-dir! (.getParent (io/file path)))
+  (exec! conn (str "COPY goals TO '" path "' (FORMAT PARQUET)")))
+
+(defn save-goal!
+  "Insert a new goal. Returns the goal id."
+  [ctx goal]
+  (with-provenance "loom.db/save-goal!" 1
+    (write!
+      (fn []
+        (let [conn  (:conn ctx)
+              path  (parquet-path (get-in ctx [:config :loom-dir]) :goals)
+              id    (or (:id goal) (uuid))
+              vec-s (float-vec->sql (:vector goal))]
+          (load-goals-table! conn path)
+          (exec! conn
+            "INSERT INTO goals (id, session_id, parent_id, title, description,
+                                success_criteria, status, vector)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+            id (:session-id goal) (:parent-id goal) (:title goal) (:description goal)
+            (:success-criteria goal) (or (:status goal) "open") vec-s)
+          (flush-goals! conn path)
+          id)))))
+
+(defn update-goal-status!
+  "Transition goal to a new status. Valid: open|active|blocked|done|abandoned."
+  [ctx goal-id status]
+  (with-provenance "loom.db/update-goal-status!" 1
+    (when-not (valid-statuses status)
+      (throw (ex-info "Invalid goal status" {:status status :allowed valid-statuses})))
+    (write!
+      (fn []
+        (let [conn (:conn ctx)
+              path (parquet-path (get-in ctx [:config :loom-dir]) :goals)]
+          (load-goals-table! conn path)
+          (exec! conn "UPDATE goals SET status = ?, updated_at = now() WHERE id = ?"
+                 status goal-id)
+          (flush-goals! conn path)
+          goal-id)))))
+
+(defn get-goal
+  "Fetch a single goal by id, or nil."
+  [ctx goal-id]
+  (with-provenance "loom.db/get-goal" 1
+    (let [conn (:conn ctx)
+          path (parquet-path (get-in ctx [:config :loom-dir]) :goals)]
+      (when (.exists (io/file path))
+        (first (query conn (str "SELECT * FROM read_parquet('" path "') WHERE id = ?")
+                      goal-id))))))
+
+(defn list-goals
+  "opts: {:scope :session|:global :session-id sid :statuses [\"open\" ...]}"
+  [ctx {:keys [scope session-id statuses]}]
+  (with-provenance "loom.db/list-goals" 1
+    (let [bad (remove valid-statuses statuses)]
+      (when (seq bad)
+        (throw (ex-info "Invalid goal status" {:invalid bad :allowed valid-statuses}))))
+    (let [conn        (:conn ctx)
+          path        (parquet-path (get-in ctx [:config :loom-dir]) :goals)
+          status-list (str "(" (str/join "," (map #(str "'" % "'") statuses)) ")")
+          where       (cond-> (str "status IN " status-list)
+                        (= scope :session) (str " AND session_id = ?"))
+          params      (if (= scope :session) [session-id] [])]
+      (if (.exists (io/file path))
+        (apply query conn (str "SELECT * FROM read_parquet('" path "') WHERE " where
+                               " ORDER BY created_at DESC") params)
+        []))))
+
+(defn list-goal-children
+  "Return all goals whose parent_id = parent-id."
+  [ctx parent-id]
+  (with-provenance "loom.db/list-goal-children" 1
+    (let [conn (:conn ctx)
+          path (parquet-path (get-in ctx [:config :loom-dir]) :goals)]
+      (if (.exists (io/file path))
+        (query conn (str "SELECT * FROM read_parquet('" path "') WHERE parent_id = ?")
+               parent-id)
+        []))))
+
+(defn list-goal-events
+  "Return all events linked to goal-id, ordered by ts ASC."
+  [ctx goal-id]
+  (with-provenance "loom.db/list-goal-events" 1
+    (let [conn (:conn ctx)
+          path (parquet-path (get-in ctx [:config :loom-dir]) :events)]
+      (if (.exists (io/file path))
+        (query conn (str "SELECT * FROM read_parquet('" path "') WHERE goal_id = ?
+                          ORDER BY ts ASC") goal-id)
+        []))))
+
+(defn link-event-to-goal!
+  "Set events.goal_id = goal-id for a specific event."
+  [ctx event-id goal-id]
+  (with-provenance "loom.db/link-event-to-goal!" 1
+    (write!
+      (fn []
+        (let [conn (:conn ctx)
+              path (parquet-path (get-in ctx [:config :loom-dir]) :events)]
+          (load-events-table! conn path)
+          (exec! conn "UPDATE events SET goal_id = ? WHERE id = ?" goal-id event-id)
+          (flush-events! conn path)
+          event-id)))))

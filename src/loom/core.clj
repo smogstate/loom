@@ -42,7 +42,8 @@
 (def ^:private seed-namespaces
   '[loom.seed.http loom.seed.fs loom.seed.text
     loom.seed.data loom.seed.math loom.seed.db
-    loom.seed.project loom.seed.eval])
+    loom.seed.project loom.seed.eval
+    loom.goals])
 
 (defn bootstrap!
   "Seed the tool library. Registers any seed tool not yet in the DB."
