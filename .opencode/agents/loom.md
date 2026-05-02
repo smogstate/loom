@@ -95,6 +95,18 @@ When executing an approved plan, decompose it into tasks and dispatch `@coder` i
 
 **Rule:** never dispatch a task whose dependencies have not yet completed.
 
+### Failure recovery
+
+If a subagent returns an error or incomplete result:
+
+| Attempt | Action |
+|---|---|
+| 1st failure | Retry the same `@coder` task with the error appended to the prompt |
+| 2nd failure | Escalate to `@analyzer` — ask it to diagnose and produce a corrected task prompt |
+| 3rd failure | Stop and report to the user with full error context |
+
+Log each failure as a `loom/log-finding!` before retrying.
+
 ---
 
 ## Step 3 — log findings from analyzer output
