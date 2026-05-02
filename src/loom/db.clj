@@ -520,21 +520,47 @@
      vector     VARCHAR,
      content    VARCHAR,
      provenance VARCHAR,
-     ts         TIMESTAMP DEFAULT now()
+     ts         TIMESTAMP DEFAULT now(),
+     goal_id    VARCHAR,
+     thread_id  VARCHAR
    )")
+
+(def ^:private events-cols
+  ;; Order must match events-ddl declaration order.
+  ["id" "session_id" "agent_id" "type" "vector" "content" "provenance" "ts"
+   "goal_id" "thread_id"])
+
+(defn- parquet-columns
+  "Return the set of column names present in a parquet file (lower-cased)."
+  [conn path]
+  (->> (query conn (str "SELECT name FROM parquet_schema('" path "')"))
+       (map (comp str/lower-case :name))
+       set))
+
+(defn- events-projection
+  "Build the SELECT list, replacing missing columns with NULL AS <col>."
+  [present]
+  (->> events-cols
+       (map (fn [c] (if (contains? present c) c (str "NULL AS " c))))
+       (str/join ", ")))
 
 (defn- load-events-table! [conn path]
   (exec! conn "DROP TABLE IF EXISTS events")
   (exec! conn events-ddl)
   (when (.exists (io/file path))
-    (exec! conn (str "INSERT INTO events SELECT * FROM read_parquet('" path "')"))))
+    (let [present (parquet-columns conn path)
+          select  (events-projection present)]
+      (exec! conn
+        (str "INSERT INTO events SELECT " select
+             " FROM read_parquet('" path "')")))))
 
 (defn- flush-events! [conn path]
   (ensure-dir! (.getParent (io/file path)))
   (exec! conn (str "COPY events TO '" path "' (FORMAT PARQUET)")))
 
 (defn log-event!
-  "Append a structural event with provenance."
+  "Append a structural event with provenance.
+   Optional :goal-id (business scope), :thread-id (technical scope)."
   [ctx event]
   (with-provenance "loom.db/log-event!" 1
     (write!
@@ -546,10 +572,12 @@
               prov  (json/encode (or (:provenance event) {}))]
           (load-events-table! conn path)
           (exec! conn
-            "INSERT INTO events (id, session_id, agent_id, type, vector, content, provenance)
-             VALUES (?, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO events
+               (id, session_id, agent_id, type, vector, content, provenance, goal_id, thread_id)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
             id (:session-id event) (:agent-id event) (:type event)
-            vec-s (:content event) prov)
+            vec-s (:content event) prov
+            (:goal-id event) (:thread-id event))
           (flush-events! conn path)
           id)))))
 
@@ -569,6 +597,53 @@
              (mapv (fn [r] (-> r
                                (update :provenance parse-json)
                                (update :vector parse-float-vec)))))
+        []))))
+
+(defn search-events-in-thread
+  "Fetch events tagged with exactly thread-id, optionally filtered by type.
+   Pure SQL — no vector search. Pass type=nil to skip type filter.
+   Results ordered by ts ASC (chronological)."
+  [ctx thread-id type limit]
+  (with-provenance "loom.db/search-events-in-thread" 1
+    (let [conn (:conn ctx)
+          path (parquet-path (get-in ctx [:config :loom-dir]) :events)
+          [where params] (if type
+                           ["thread_id = ? AND type = ?" [thread-id type]]
+                           ["thread_id = ?"              [thread-id]])]
+      (if (.exists (io/file path))
+        (->> (apply query conn
+               (str "SELECT id, session_id, agent_id, type, content, provenance, ts,
+                            goal_id, thread_id
+                     FROM read_parquet('" path "')
+                     WHERE " where "
+                     ORDER BY ts ASC
+                     LIMIT " (int limit))
+               params)
+             (mapv #(update % :provenance parse-json)))
+        []))))
+
+(defn search-events-by-prefix
+  "Fetch events whose thread_id starts with prefix + '/'.
+   Use for parent-thread roll-ups (e.g. all repairs under plan/X).
+   Results ordered by ts ASC."
+  [ctx prefix type limit]
+  (with-provenance "loom.db/search-events-by-prefix" 1
+    (let [conn (:conn ctx)
+          path (parquet-path (get-in ctx [:config :loom-dir]) :events)
+          like (str prefix "/%")
+          [where params] (if type
+                           ["thread_id LIKE ? AND type = ?" [like type]]
+                           ["thread_id LIKE ?"              [like]])]
+      (if (.exists (io/file path))
+        (->> (apply query conn
+               (str "SELECT id, session_id, agent_id, type, content, provenance, ts,
+                            goal_id, thread_id
+                     FROM read_parquet('" path "')
+                     WHERE " where "
+                     ORDER BY ts ASC
+                     LIMIT " (int limit))
+               params)
+             (mapv #(update % :provenance parse-json)))
         []))))
 
 ;; ---------------------------------------------------------------------------
