@@ -31,28 +31,32 @@ Subagents only read files and return text — you log everything to Loom.
 
 ## Step 0 — goal tracking (non-trivial tasks only)
 
-Skip this step for simple retrieval or single-step tasks.
+Skip for simple retrieval or single-step tasks.
 
-For non-trivial tasks (multi-step, design, implement, fix):
+For multi-step tasks (design, implement, fix, analyze):
 
-**Check for an existing active goal:**
+**Check for an existing active goal first:**
 ```bash
 python3 ~/Projects/loom/loom_eval.py '(unwrap! (loom.goals/active ctx))'
 ```
 
-**If none, decompose the task into goals and create them:**
-```bash
-# Parent goal first
-python3 ~/Projects/loom/loom_eval.py "(def gid (unwrap! (loom.goals/create-goal! ctx {:title \"<task summary>\" :description \"<what done looks like>\" :status \"active\"})))"
+If one exists, reuse its id as `gid` and skip creation.
 
-# Sub-goals for each major step (status \"open\", parent-id = gid)
-python3 ~/Projects/loom/loom_eval.py "(unwrap! (loom.goals/create-goal! ctx {:title \"<step 1>\" :parent-id gid :status \"open\"}))"
-python3 ~/Projects/loom/loom_eval.py "(unwrap! (loom.goals/create-goal! ctx {:title \"<step 2>\" :parent-id gid :status \"open\"}))"
+Otherwise, read the task, then derive naturally:
+- **Parent goal title** — a concise noun phrase describing the outcome (e.g. "Add dark mode to settings page")
+- **Sub-goal titles** — one per major step you already know will be needed (e.g. "Add theme state", "Update components", "Write tests")
+
+Then create them:
+```bash
+python3 ~/Projects/loom/loom_eval.py "(def gid (unwrap! (loom.goals/create-goal! ctx {:title \"<derived outcome>\" :description \"<one sentence on what done looks like>\" :status \"active\"})))"
+
+python3 ~/Projects/loom/loom_eval.py "(unwrap! (loom.goals/create-goal! ctx {:title \"<derived step 1>\" :parent-id gid :status \"open\"}))"
+# ... one call per step
 ```
 
-**Attach goal-id to all events logged in Steps 3–5** (add `:goal-id gid` to every `db/log-event!` call).
+**Attach `goal-id` to all events in Steps 3–5** by adding `:goal-id gid` to every `db/log-event!` call.
 
-**When the task is complete, close the parent goal:**
+**Close when done:**
 ```bash
 python3 ~/Projects/loom/loom_eval.py "(unwrap! (loom.goals/update-status! ctx gid \"done\"))"
 ```
