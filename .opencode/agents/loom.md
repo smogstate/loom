@@ -62,7 +62,7 @@ Add `:goal-id gid` to every event logged in Steps 3–5.
 
 Close when done: `loom/close-goal!`
 
-> If returning early (Step 1 cache hit), close the goal with status `completed` before returning.
+> If returning early (Step 1 cache hit), close the goal with status `"done"` before returning.
 
 ---
 
@@ -160,10 +160,13 @@ After `@analyzer` returns, extract its major claims and log each:
 
 ## Step 4 — log reviewer verdict
 
-Parse the reviewer's first line for `VERDICT: APPROVED` or `VERDICT: REJECTED`.
+Parse the reviewer's first line for one of three verdicts:
 
-- Approved: `loom/log-approval!`
-- Rejected: `loom/log-rejection!`
+| First line | Action |
+|---|---|
+| `VERDICT: APPROVED` | `loom/log-approval!` — proceed to implementation |
+| `VERDICT: APPROVED_WITH_REVISIONS` | `loom/log-approval!` — apply the listed required revisions before dispatching `@coder` |
+| `VERDICT: REJECTED` | `loom/log-rejection!` — return the defects list to `@analyzer` for repair, then re-review |
 
 ---
 

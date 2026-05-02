@@ -122,6 +122,18 @@ python3 ~/Projects/loom/loom_eval.py '(db/log-event! ctx {:type "rejection" :con
 
 ---
 
+### loom/log-failure!
+
+Log a task failure event (use before retrying a failed subagent task).
+
+```bash
+python3 ~/Projects/loom/loom_eval.py '(db/log-event! ctx {:type "failure" :content "CONTENT" :session-id (:session-id ctx) :agent-id "AGENT_ID" :goal-id "GOAL_ID"})'
+```
+
+Omit `:goal-id` if no active goal.
+
+---
+
 ### loom/active-goal
 
 Get the current active goal (returns nil if none).

@@ -34,7 +34,7 @@ Load skill: `loom`
 2. **Completeness** — edge cases covered? Known gaps documented?
 3. **API quality** — all public fns use `with-provenance`? No name collisions (verified via `loom/search-tools`)?
 4. **Diff skeleton** — are integration changes concrete and accurate?
-5. **Migration safety** — schema changes backward compatible?
+5. **Migration safety** — are schema changes backward compatible? Check `resources/migrations/` for new column/table additions; verify no existing columns are dropped or renamed without a migration; confirm DuckDB schema changes use `ALTER TABLE … ADD COLUMN IF NOT EXISTS` or equivalent safe patterns.
 6. **Task declarations** — does every plan task declare `depends-on`?
 
 **Decision rule:** Approve only when all six items pass. Reject if any item fails or cannot be verified.

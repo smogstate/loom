@@ -45,7 +45,10 @@ Load skill: `loom`
 
 Before writing any conclusion or citing any code, you MUST:
 
-1. **Locate** — use `loom.seed.fs/search-source` to find the exact file and line number
+1. **Locate** — use `loom.seed.fs/search-source` to find the exact file and line number:
+   ```bash
+   python3 ~/Projects/loom/loom_eval.py '(unwrap! (loom.seed.fs/search-source ctx "SYMBOL_OR_PATTERN" 5))'
+   ```
 2. **Read** — use the Read tool to view the actual lines around the match
 3. **Verify signature** — confirm the function name, arity, and return type match what you plan to cite
 4. **Verify line numbers** — the line numbers in your conclusion must match what Read returned

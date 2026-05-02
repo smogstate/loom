@@ -47,3 +47,6 @@ Return a markdown list. Each item:
 ```
 
 If nothing was found, return: `FOUND: nothing`
+
+If the Loom nREPL is unreachable (connection refused on port 7888), return:
+`FOUND: nothing — nREPL unavailable (port 7888 not responding)`
