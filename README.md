@@ -7,6 +7,8 @@ It gives agents:
 - **Semantic search** over memory and tools using local embeddings
 - **A tool registry** — agents discover, register, and reuse Clojure functions
 - **Blob ingestion** — chunk and embed documents for RAG
+- **Goal tracking** — hierarchical goals with status transitions and event linkage
+- **Budget enforcement** — per-agent call/duration limits with usage recording
 - **An nREPL server** — the agent connects and calls everything as live Clojure
 
 ---
@@ -19,13 +21,16 @@ External agent (OpenCode / human at REPL)
   │  nREPL :7888
   ▼
 loom.core/start!
-  ├── loom.db          — DuckDB engine over parquet files (.loom/tools.parquet, chunks.parquet, sessions/)
+  ├── loom.db          — DuckDB engine over parquet files (.loom/*.parquet, sessions/)
   ├── loom.embedder    — Ollama nomic-embed-text (768-dim)
   ├── loom.tools       — register!, scan-ns!, search
   ├── loom.session     — per-session fact logging (tier 2 memory)
   ├── loom.memory      — promote to global facts, forget, suggest
   ├── loom.blob        — ingest documents, chunk, embed
   ├── loom.state       — in-process atom mirror of tool registry
+  ├── loom.scratch     — session-scoped tool creation, hit tracking, promotion
+  ├── loom.goals       — hierarchical goal tracking, status transitions
+  ├── loom.budget      — per-agent usage recording and budget enforcement
   └── loom.repl        — nREPL server on port 7888
 ```
 
@@ -33,9 +38,22 @@ loom.core/start!
 
 | Tier | Namespace | Storage | Scope |
 |---|---|---|---|
-| 1 — Working | `scratchpad` atom | In-process | Single turn |
-| 2 — Session | `loom.session` | DuckDB session facts table | Current session |
-| 3 — Global | `loom.memory` | DuckDB facts table | All sessions |
+| 1 — Scratch | `loom.scratch` | `scratch/*.clj` + session `hits.parquet` | Session (persisted, not promoted) |
+| 2 — Session | `loom.session` | DuckDB session facts parquet | Current session |
+| 3 — Global | `loom.memory` | DuckDB global facts parquet | All sessions |
+
+### Parquet files
+
+| File | Contents |
+|---|---|
+| `.loom/tools.parquet` | Registered tool definitions |
+| `.loom/facts.parquet` | Global promoted facts |
+| `.loom/events.parquet` | Audit trail (findings, conclusions, approvals) |
+| `.loom/chunks.parquet` | Blob document chunks for RAG |
+| `.loom/goals.parquet` | Hierarchical goals |
+| `.loom/usage.parquet` | Per-agent tool call usage (budget) |
+| `.loom/sessions/<id>/facts.parquet` | Session-scoped facts |
+| `.loom/sessions/<id>/hits.parquet` | Scratch tool hit counts |
 
 ---
 
@@ -123,7 +141,47 @@ Connect to nREPL on port 7888, then:
 
 ### Log an event (audit trail)
 ```clojure
-(db/log-event! ctx {:type "finding" :content "..." :session-id (:session-id ctx) :agent-id "finder"})
+(db/log-event! ctx {:type       "finding"          ; or "conclusion" "approval" "rejection"
+                    :content    "..."
+                    :session-id (:session-id ctx)
+                    :agent-id   "finder"
+                    :goal-id    "goal-uuid"         ; optional — links event to a goal
+                    :thread-id  "plan/X/step/1"})   ; optional — groups related events
+```
+
+### Track goals
+```clojure
+(require '[loom.goals :as goals])
+
+(def gid (unwrap! (goals/create-goal! ctx {:title       "Refactor auth module"
+                                           :description "Extract JWT logic into its own ns"
+                                           :status      "open"})))
+
+(goals/update-status! ctx gid "active")
+(goals/link-event!    ctx gid event-id)
+```
+
+### Meter agent tool calls (budget)
+```clojure
+(require '[loom.budget :as budget])
+
+;; Wrap every agent tool call — enforces limits, records usage
+(binding [budget/*agent-id* "analyzer"]
+  (budget/call ctx db/search-tools [query-vec 5]))
+
+;; Inspect usage for the current session
+(unwrap! (budget/current-usage ctx "analyzer"))
+;; => {:usd 0.0 :duration_ms 340 :calls 12}
+
+;; Full report grouped by agent + op
+(unwrap! (budget/report ctx {}))
+```
+
+Budget limits are configured in `.loom/budget.edn`:
+```clojure
+{:budgets {:default   {:usd 1.00 :duration-ms 60000  :calls 1000}
+           "analyzer" {:usd 5.00 :duration-ms 300000 :calls 5000}
+           "finder"   {:usd 1.00 :duration-ms 60000  :calls 2000}}}
 ```
 
 ---
@@ -150,9 +208,9 @@ Every Loom function returns a provenance envelope:
 ```clojure
 {:ok?        true
  :result     <value>
- :provenance {:op          "loom.db/save-tool!"
-              :version     1
-              :duration-ms 12
+ :provenance {:op            "loom.db/save-tool!"
+              :version       1
+              :duration-ms   12
               :started-at-ms 1234567890}
  :error      nil}
 ```
@@ -175,9 +233,11 @@ src/loom/
   tools.clj      — register!, scan-ns!, start-watcher!
   blob.clj       — ingest!, chunk!, embed documents
   init.clj       — index project source files (idempotent)
-  scratch.clj    — session-scoped tool creation & promotion
+  scratch.clj    — session-scoped tool creation, hit tracking, promotion
+  goals.clj      — hierarchical goal tracking and event linkage
+  budget.clj     — per-agent usage recording and budget enforcement
   repl.clj       — nREPL server start!/stop!
-  seed/          — built-in tool libraries (http, fs, text, data, math, db, project)
+  seed/          — built-in tool libraries (http, fs, text, data, math, db, project, eval)
 
 .opencode/       — OpenCode integration (agents, commands, skills) — canonical source of truth
 loom_eval.py     — minimal Python nREPL client (strips :vector fields for readability)
