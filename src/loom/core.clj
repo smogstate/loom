@@ -77,6 +77,8 @@
   ([opts]
    (let [ctx (make-ctx opts)]
      (bootstrap! ctx)
+     (require 'loom.budget)
+     ((resolve 'loom.budget/init!) ctx)
      (scratch/load-all! ctx)
      (maybe-ingest-loom-md! ctx)
      (tools/start-watcher! ctx)

@@ -647,6 +647,75 @@
         []))))
 
 ;; ---------------------------------------------------------------------------
+;; Usage — global (loom.budget)
+;; ---------------------------------------------------------------------------
+
+(def ^:private usage-ddl
+  "CREATE TABLE IF NOT EXISTS usage (
+     id          VARCHAR PRIMARY KEY,
+     ts          TIMESTAMP DEFAULT now(),
+     session_id  VARCHAR,
+     agent_id    VARCHAR,
+     op          VARCHAR,
+     version     INTEGER,
+     duration_ms BIGINT,
+     ok          BOOLEAN,
+     usd_cost    DOUBLE,
+     tokens_in   INTEGER,
+     tokens_out  INTEGER
+   )")
+
+(defn- load-usage-table! [conn path]
+  (exec! conn "DROP TABLE IF EXISTS usage")
+  (exec! conn usage-ddl)
+  (when (.exists (io/file path))
+    (exec! conn (str "INSERT INTO usage SELECT * FROM read_parquet('" path "')"))))
+
+(defn- flush-usage! [conn path]
+  (ensure-dir! (.getParent (io/file path)))
+  (exec! conn (str "COPY usage TO '" path "' (FORMAT PARQUET)")))
+
+(defn save-usage-batch!
+  "Append a batch of usage rows. Routed through write! queue."
+  [ctx rows]
+  (with-provenance "loom.db/save-usage-batch!" 1
+    (write!
+      (fn []
+        (let [conn (:conn ctx)
+              path (parquet-path (get-in ctx [:config :loom-dir]) :usage)]
+          (load-usage-table! conn path)
+          (doseq [r rows]
+            (exec! conn
+              "INSERT INTO usage
+                 (id, session_id, agent_id, op, version,
+                  duration_ms, ok, usd_cost, tokens_in, tokens_out)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+              (:id r) (:session_id r) (:agent_id r) (:op r) (:version r)
+              (:duration_ms r) (:ok r) (:usd_cost r) (:tokens_in r) (:tokens_out r)))
+          (flush-usage! conn path)
+          (count rows))))))
+
+(defn query-usage-scalar
+  "Run a parameterised SELECT that returns a single aggregate row against
+   the in-memory usage table (after loading from parquet). Returns first row map
+   or nil."
+  [ctx sql & params]
+  (with-provenance "loom.db/query-usage-scalar" 1
+    (let [conn (:conn ctx)
+          path (parquet-path (get-in ctx [:config :loom-dir]) :usage)]
+      (load-usage-table! conn path)
+      (first (apply query conn sql params)))))
+
+(defn query-usage-raw
+  "Run a parameterised SELECT against usage table. Returns vec of row maps."
+  [ctx sql & params]
+  (with-provenance "loom.db/query-usage-raw" 1
+    (let [conn (:conn ctx)
+          path (parquet-path (get-in ctx [:config :loom-dir]) :usage)]
+      (load-usage-table! conn path)
+      (vec (apply query conn sql params)))))
+
+;; ---------------------------------------------------------------------------
 ;; Chunks — global
 ;; ---------------------------------------------------------------------------
 
