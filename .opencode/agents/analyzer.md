@@ -41,6 +41,18 @@ Load skill: `loom`
 - Each task in the plan must declare `depends-on: [task-ids]` (or `depends-on: none`)
 - Status: DRAFT
 
+## Pre-conclusion checklist
+
+Before writing any conclusion or citing any code, you MUST:
+
+1. **Locate** — use `loom.seed.fs/search-source` to find the exact file and line number
+2. **Read** — use the Read tool to view the actual lines around the match
+3. **Verify signature** — confirm the function name, arity, and return type match what you plan to cite
+4. **Verify line numbers** — the line numbers in your conclusion must match what Read returned
+5. **Then conclude** — only after steps 1–4 are complete
+
+If you skip any step and cite wrong line numbers or signatures, the reviewer will reject your conclusion.
+
 ## Self-repair
 
 If a tool throws: fix it, test in a scratch eval, re-register.

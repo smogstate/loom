@@ -1,6 +1,7 @@
 (ns loom.seed.fs
-  "Filesystem tools: read, write, list."
+  "Filesystem tools: read, write, list, search."
   (:require [clojure.java.io :as io]
+            [clojure.string :as str]
             [loom.envelope :refer [with-provenance]]))
 
 (defn read-file
@@ -29,3 +30,28 @@
   (with-provenance "loom.seed.fs/list-dir" 1
     (->> (file-seq (io/file path))
          (mapv str))))
+
+(defn search-source
+  "Search source files for a pattern using ripgrep.
+   Returns up to 50 matches as {:file :line :text} maps.
+   Use this to verify exact line numbers and signatures before citing code."
+  {:doc "Grep source files by regex using rg. Returns file path, line number, matched text. Use before citing code in conclusions."
+   :tags ["fs" "search" "grep" "source" "verify" "code" "rg"]}
+  ([ctx pattern] (search-source ctx pattern "."))
+  ([ctx pattern dir]
+   (with-provenance "loom.seed.fs/search-source" 1
+      (let [proc (-> (ProcessBuilder. ["/usr/bin/rg" "--line-number" "--no-heading"
+                                       "--max-count" "50"
+                                       "--glob" "*.clj"
+                                       pattern dir])
+                    (.redirectErrorStream true)
+                    .start)
+           out  (slurp (.getInputStream proc))
+           _    (.waitFor proc)]
+        (->> (str/split-lines out)
+             (filter seq)
+             (mapv (fn [line]
+                     (let [[file ln text] (str/split line #":" 3)]
+                       (if (and file ln text)
+                         {:file file :line (parse-long (str/trim ln)) :text (str/trim text)}
+                         {:file line :line nil :text line})))))))))

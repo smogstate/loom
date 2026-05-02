@@ -39,9 +39,9 @@
     (if (< (- now (:ts cache)) config-ttl-ms)
       (:cfg cache)
       (let [path (str (get-in ctx [:config :loom-dir]) "/budget.edn")
-            cfg  (if (.exists (io/file path))
-                   (merge-with merge default-config (edn/read-string (slurp path)))
-                   default-config)]
+        cfg  (if (.exists (io/file path))
+                    (merge default-config (edn/read-string (slurp path)))
+                    default-config)]
         (reset! config-cache {:ts now :cfg cfg})
         cfg))))
 
@@ -106,13 +106,21 @@
            cfg         (load-config* ctx)
            tokens-in   (or (:tokens-in opts)  (:tokens-in prov))
            tokens-out  (or (:tokens-out opts) (:tokens-out prov))
-           usd-per-tok (get-in cfg [:ops op :usd-per-token]
+            ;; Look up per-token costs by agent-id (model name), falling back to :default
+            token-costs  (or (get-in cfg [:token-costs agent-id])
+                             (get-in cfg [:token-costs :default])
+                             {:usd-per-token-in 0.0 :usd-per-token-out 0.0})
+            usd-per-tok-in  (or (get-in cfg [:ops op :usd-per-token-in])
+                                (:usd-per-token-in token-costs)
                                 (get-in cfg [:default :usd-per-token] 0.0))
-           usd-per-call (get-in cfg [:ops op :usd-per-call]
-                                 (get-in cfg [:default :usd-per-call] 0.0))
-           usd         (+ usd-per-call
-                          (* (or tokens-in 0) usd-per-tok)
-                          (* (or tokens-out 0) usd-per-tok))
+            usd-per-tok-out (or (get-in cfg [:ops op :usd-per-token-out])
+                                (:usd-per-token-out token-costs)
+                                (get-in cfg [:default :usd-per-token] 0.0))
+            usd-per-call (get-in cfg [:ops op :usd-per-call]
+                                  (get-in cfg [:default :usd-per-call] 0.0))
+            usd         (+ usd-per-call
+                           (* (or tokens-in 0) usd-per-tok-in)
+                           (* (or tokens-out 0) usd-per-tok-out))
            row         {:id          (str (java.util.UUID/randomUUID))
                         :session_id  (:session-id ctx)
                         :agent_id    agent-id

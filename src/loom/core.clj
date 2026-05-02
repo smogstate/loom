@@ -17,13 +17,14 @@
 (defn make-ctx
   "Build the ctx map. loom-dir defaults to .loom."
   ([] (make-ctx {}))
-  ([{:keys [loom-dir ollama-url models session-id]
+   ([{:keys [loom-dir ollama-url models session-id]
      :or   {loom-dir   ".loom"
             ollama-url "http://localhost:11434"
             models     {:cheap  "claude-haiku-4-5"
                         :strong "claude-sonnet-4-5"}}}]
-   (let [sid  (or session-id (str (java.util.UUID/randomUUID)))
-         conn (db/connect!)]
+   (let [sid      (or session-id (str (java.util.UUID/randomUUID)))
+         loom-dir (-> (io/file loom-dir) .getAbsolutePath)
+         conn     (db/connect!)]
      ;; ensure dirs
      (.mkdirs (io/file loom-dir "sessions" sid))
      (db/start-writer!)
