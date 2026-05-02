@@ -4,6 +4,7 @@
             [loom.embedder :as embedder]
             [loom.state :as state]
             [loom.tools :as tools]
+            [loom.guard :as guard]
             [loom.scratch :as scratch]
             [loom.repl :as repl]
             [clojure.java.io :as io]
@@ -76,6 +77,7 @@
   ([] (start! {}))
   ([opts]
    (let [ctx (make-ctx opts)]
+     (guard/init! ctx)
      (bootstrap! ctx)
      (require 'loom.budget)
      ((resolve 'loom.budget/init!) ctx)

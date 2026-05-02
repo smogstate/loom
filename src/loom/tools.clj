@@ -55,7 +55,10 @@
 ;; ---------------------------------------------------------------------------
 
 (defn start-watcher!
-  "Add a watch on session-state that persists newly registered tools to DuckDB."
+  "Add a watch on session-state that persists newly registered tools to DuckDB.
+   NOTE: tools observed here have already been wrapped by loom.guard/wrap-tool
+   inside loom.state/add-tool!, so db/save-tool! will persist the guarded :fn.
+   Do not unwrap."
   [ctx]
   (add-watch state/session-state :tool-vectorizer
     (fn [_ _ old new]

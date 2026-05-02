@@ -963,5 +963,26 @@
               path (parquet-path (get-in ctx [:config :loom-dir]) :events)]
           (load-events-table! conn path)
           (exec! conn "UPDATE events SET goal_id = ? WHERE id = ?" goal-id event-id)
-          (flush-events! conn path)
+           (flush-events! conn path)
           event-id)))))
+
+;; ---------------------------------------------------------------------------
+;; Guard helpers — thin pass-throughs for loom.guard/search-denials
+;; ---------------------------------------------------------------------------
+
+(defn connection
+  "Return the raw DuckDB connection from ctx."
+  [ctx]
+  (:conn ctx))
+
+(defn events-path
+  "Return the absolute path to events.parquet."
+  [ctx]
+  (parquet-path (get-in ctx [:config :loom-dir]) :events))
+
+(defn query-raw
+  "Execute a parameterised SELECT on conn. Returns vec of row maps.
+   Thin public wrapper over the private query fn."
+  [conn sql params]
+  (apply query conn sql params))
+
