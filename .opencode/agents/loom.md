@@ -95,6 +95,16 @@ When executing an approved plan, decompose it into tasks and dispatch `@coder` i
 
 **Rule:** never dispatch a task whose dependencies have not yet completed.
 
+**Task prompt format** — prefix every `@coder` task with the file path and a one-line description:
+
+```
+File: src/loom/foo.clj
+Task: Add function `bar` that does X
+Context: <paste relevant excerpt from plan>
+```
+
+This gives `@coder` enough context without it needing to re-read the plan.
+
 ### Failure recovery
 
 If a subagent returns an error or incomplete result:
@@ -106,6 +116,19 @@ If a subagent returns an error or incomplete result:
 | 3rd failure | Stop and report to the user with full error context |
 
 Log each failure as a `loom/log-finding!` before retrying.
+
+### Model fallback
+
+If a subagent fails due to a model error (rate limit, unavailable, timeout):
+
+| Agent | Primary model | Fallback |
+|---|---|---|
+| `@analyzer` | `claude-opus-4.7` | `claude-sonnet-4.6` |
+| `@finder` | `claude-haiku-4.5` | `claude-sonnet-4.6` |
+| `@reviewer` | `claude-sonnet-4.6` | `claude-haiku-4.5` (read-only, safe) |
+| `@coder` | `claude-sonnet-4.6` | none — retry once, then escalate |
+
+To use a fallback: re-dispatch the same task with `model: <fallback>` overridden in the prompt header, and log a finding noting the fallback was used.
 
 ---
 
