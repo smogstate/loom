@@ -20,13 +20,14 @@ const ICONS = {
   default:   "🔧",
 };
 
-function icon(toolName) {
+function icon(toolName, args) {
+  if (args?.command && args.command.includes("loom_eval")) return "🚀";
   const key = toolName.toLowerCase().replace(/[^a-z]/g, "");
   return ICONS[key] ?? ICONS.default;
 }
 
 function compactTitle(toolName, args, lineCount) {
-  const ic   = icon(toolName);
+  const ic   = icon(toolName, args);
   const name = toolName.split(".").pop();
 
   let hint = "";
