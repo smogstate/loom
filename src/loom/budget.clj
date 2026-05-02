@@ -91,25 +91,39 @@
 
 (defn record!
   "Append a usage row derived from an envelope. Returns envelope unchanged.
-   Batched via in-memory ring; flushed every 64 rows or 5s."
-  [ctx envelope agent-id]
-  (with-provenance "loom.budget/record!" 1
-    (let [prov    (get envelope :provenance {})
-          op      (get prov :op "unknown")
-          cfg     (load-config* ctx)
-          usd     (get-in cfg [:ops op :usd-per-call]
-                           (get-in cfg [:default :usd-per-call] 0.0))
-          row     {:id          (str (java.util.UUID/randomUUID))
-                   :session_id  (:session-id ctx)
-                   :agent_id    agent-id
-                   :op          op
-                   :version     (get prov :version 1)
-                   :duration_ms (get prov :duration-ms 0)
-                   :ok          (boolean (:ok? envelope))
-                   :usd_cost    (double usd)
-                   :tokens_in   nil
-                   :tokens_out  nil}]
-      (enqueue-row! ctx row)
+   Batched via in-memory ring; flushed every 64 rows or 5s.
+
+   Optional opts map:
+     :tokens-in  — number of input tokens consumed by the LLM call
+     :tokens-out — number of output tokens produced by the LLM call
+
+   Tokens are also read from envelope :provenance if present, with opts taking precedence."
+  ([ctx envelope agent-id] (record! ctx envelope agent-id {}))
+  ([ctx envelope agent-id opts]
+   (with-provenance "loom.budget/record!" 1
+     (let [prov        (get envelope :provenance {})
+           op          (get prov :op "unknown")
+           cfg         (load-config* ctx)
+           tokens-in   (or (:tokens-in opts)  (:tokens-in prov))
+           tokens-out  (or (:tokens-out opts) (:tokens-out prov))
+           usd-per-tok (get-in cfg [:ops op :usd-per-token]
+                                (get-in cfg [:default :usd-per-token] 0.0))
+           usd-per-call (get-in cfg [:ops op :usd-per-call]
+                                 (get-in cfg [:default :usd-per-call] 0.0))
+           usd         (+ usd-per-call
+                          (* (or tokens-in 0) usd-per-tok)
+                          (* (or tokens-out 0) usd-per-tok))
+           row         {:id          (str (java.util.UUID/randomUUID))
+                        :session_id  (:session-id ctx)
+                        :agent_id    agent-id
+                        :op          op
+                        :version     (get prov :version 1)
+                        :duration_ms (get prov :duration-ms 0)
+                        :ok          (boolean (:ok? envelope))
+                        :usd_cost    (double usd)
+                        :tokens_in   tokens-in
+                        :tokens_out  tokens-out}]
+       (enqueue-row! ctx row)
       envelope)))
 
 ;; ---------------------------------------------------------------------------

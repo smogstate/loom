@@ -53,3 +53,16 @@
     (:result envelope)
     (throw (ex-info (get-in envelope [:error :message] "tool error")
                     {:envelope envelope}))))
+
+(defn with-tokens
+  "Attach token counts to an existing envelope's :provenance map.
+   Returns the updated envelope. Use after with-provenance when token
+   counts are known (e.g. from an LLM API response).
+
+   Example:
+     (-> (with-provenance \"my-op\" (call-llm ...))
+         (with-tokens {:tokens-in 120 :tokens-out 45}))"
+  [envelope {:keys [tokens-in tokens-out]}]
+  (cond-> envelope
+    tokens-in  (assoc-in [:provenance :tokens-in]  tokens-in)
+    tokens-out (assoc-in [:provenance :tokens-out] tokens-out)))
