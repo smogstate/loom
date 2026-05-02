@@ -4,6 +4,14 @@
             [loom.embedder :as embedder]
             [loom.envelope :refer [with-provenance unwrap!]]))
 
+(def ^:private content-limit 300)
+
+(defn- truncate [s]
+  (when s
+    (if (> (count s) content-limit)
+      (str (subs s 0 content-limit) "…")
+      s)))
+
 (defn search-tools
   "Semantic search over the tool library. Returns top-k tools."
   {:doc "Search tool library by semantic similarity. Returns top-k tool records."
@@ -15,18 +23,20 @@
 
 (defn search-facts
   "Semantic search over global facts."
-  {:doc "Search global facts by semantic similarity. Returns top-k fact records."
+  {:doc "Search global facts by semantic similarity. Returns top-k fact records. Content truncated to 300 chars."
    :tags ["db" "search" "facts" "memory"]}
   [ctx query]
   (with-provenance "loom.seed.db/search-facts" 1
     (let [vec (unwrap! (embedder/embed ctx query))]
-      (unwrap! (db/search-facts ctx vec 5)))))
+      (mapv #(update % :content truncate)
+            (unwrap! (db/search-facts ctx vec 5))))))
 
 (defn search-chunks
   "Semantic search over blob chunks."
-  {:doc "Search blob chunks by semantic similarity. Returns top-k chunk records."
+  {:doc "Search blob chunks by semantic similarity. Returns top-k chunk records. Content truncated to 300 chars; use summary field for overview."
    :tags ["db" "search" "chunks" "blob"]}
   [ctx query]
   (with-provenance "loom.seed.db/search-chunks" 1
     (let [vec (unwrap! (embedder/embed ctx query))]
-      (unwrap! (db/search-chunks ctx vec 5)))))
+      (mapv #(update % :content truncate)
+            (unwrap! (db/search-chunks ctx vec 5))))))
