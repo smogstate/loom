@@ -59,7 +59,21 @@ Close when done: `loom/close-goal!`
 
 ## Step 2 — classify and dispatch
 
-Pick ONE pipeline based on intent. Call agents in order, wait for each before calling the next.
+### Fast path — explicit routing tags
+
+If the task prompt starts with a tag, skip classification and route directly:
+
+| Tag | Pipeline |
+|---|---|
+| `[retrieve]` | `@finder` only |
+| `[analyze]` | `@finder` → `@analyzer` |
+| `[plan]` | `@finder` → `@analyzer` → `@reviewer` |
+| `[implement]` | `@analyzer` (decompose) → `@coder` batches |
+| `[fix]` | `@finder` → `@analyzer` → `@reviewer` |
+
+### Slow path — intent classification
+
+No tag present? Classify the intent and pick the pipeline:
 
 | Intent | Pipeline |
 |---|---|
