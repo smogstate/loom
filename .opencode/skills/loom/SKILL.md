@@ -4,202 +4,182 @@ description: How to connect to Loom (semantic memory + tool registry), call its 
 compatibility: opencode
 ---
 
-## Agent tool usage policy
+## Transport
 
-1. **Use OpenCode tools first** — Read, Write, Edit, Glob, Grep, Bash (for git/system ops), etc.
-2. **If OpenCode tools are not enough**, use `loom-eval` via nREPL instead of writing ad-hoc Python or bash scripts.
-3. **Never write throwaway scripts** to solve problems.
-4. If the logic is reusable, define it as a Clojure function and register it as a Loom tool via `tools/register!`.
+All Loom calls go through the nREPL client. Never use `clojure -e` or `clojure -M`.
 
-**NEVER use `clojure -e` or `clojure -M` to evaluate expressions** — this starts a new JVM, breaks classpath, and will fail. Always use the nREPL transport below.
+```bash
+python3 ~/Projects/loom/loom_eval.py '<clojure expr>'
+```
 
-The nREPL transport lives at `~/Projects/loom/loom_eval.py` — it is infrastructure, not a script.
-Invoke it as: `python3 ~/Projects/loom/loom_eval.py '<clojure expr>'`
-
-All of these are already available in the nREPL namespace — **do not require them**:
+Already available in the nREPL namespace — do not require:
 - `unwrap!`, `ok?` — from `loom.envelope`
 - `ctx` — the Loom context
 - `db`, `session`, `memory`, `tools`, `embedder`, `blob`, `init` — all aliased
 
-So just call them directly:
-```bash
-python3 ~/Projects/loom/loom_eval.py '(unwrap! (session/search-facts ctx "query" 5))'
-```
+---
 
-## Check nREPL is running
+## Check / start nREPL
 
 ```bash
 nc -z localhost 7888 2>&1 && echo "running" || echo "not running"
 ```
 
----
-
-## What is Loom
-
-Loom is a semantic memory and tool registry that runs as a Clojure nREPL server on port 7888.
-Every public function returns a provenance envelope `{:ok? bool :result <value> :provenance {...} :error nil|{...}}`.
-Always unwrap with `unwrap!` before using the result.
-
----
-
-## FIRST: Ensure nREPL is running
-
-**Always do this before any Loom operation:**
-
-```bash
-nc -z localhost 7888 2>&1 && echo "running" || echo "not running"
-```
-
-If not running, start it in a background tmux session:
-
+If not running:
 ```bash
 tmux new-session -d -s loom -c ~/Projects/loom 'clojure -M:dev' 2>/dev/null || true
-# Wait for nREPL — it starts automatically via dev/user.clj -> dev/start!
 for i in $(seq 1 40); do nc -z localhost 7888 2>/dev/null && echo "nREPL ready" && break || sleep 1; done
 ```
 
 ---
 
-## Connect
+## Named helpers
 
-After nREPL is running, bootstrap once per session:
+Use these instead of writing raw Loom calls. Each expands to the exact bash command to run.
 
-```bash
-python3 ~/Projects/loom/loom_eval.py '(require (quote [dev])) (dev/start!)'
-```
+### loom/search
 
-Then every `loom_eval.py` call must require `unwrap!` if used:
+Search session memory, tools, facts, and chunks for a query.
 
 ```bash
-python3 ~/Projects/loom/loom_eval.py '(do (require (quote [loom.envelope :refer [unwrap!]])) (unwrap! (loom.seed.eval/eval-expr @dev/ctx "(+ 1 2)")))'
-```
+# Session memory (no embed needed)
+python3 ~/Projects/loom/loom_eval.py '(unwrap! (session/search-facts ctx "QUERY" 5))'
 
-`@dev/ctx` is the live context. `loom.seed.eval/eval-expr` is the registered eval tool.
+# Tools
+python3 ~/Projects/loom/loom_eval.py '(let [q (unwrap! (embedder/embed ctx "QUERY"))] (unwrap! (db/search-tools ctx q 5)))'
 
----
+# Global facts
+python3 ~/Projects/loom/loom_eval.py '(let [q (unwrap! (embedder/embed ctx "QUERY"))] (unwrap! (db/search-facts ctx q 5)))'
 
-## Embed a query
+# Source chunks
+python3 ~/Projects/loom/loom_eval.py '(let [q (unwrap! (embedder/embed ctx "QUERY"))] (unwrap! (db/search-chunks ctx q 5)))'
 
-```clojure
-(require '[loom.embedder :as embedder])
-
-(def q (unwrap! (embedder/embed ctx "your query text")))
-;; q is a 768-dim float vector — pass it to any search-* fn
-```
-
----
-
-## Search
-
-```clojure
-(require '[loom.db :as db]
-         '[loom.session :as session])
-
-;; Registered tools
-(def tools  (unwrap! (db/search-tools ctx q 5)))
-;; => [{:name "..." :doc "..." :tags [...] :code "..." :version 1} ...]
-
-;; Global memory facts
-(def facts  (unwrap! (db/search-facts ctx q 5)))
-;; => [{:content "..." :type "..." :tags [...] :session-id "..."} ...]
-
-;; Session-scoped facts (current session only, no vector needed)
-(def hits   (unwrap! (session/search-facts ctx "plain text query" 5)))
-
-;; Indexed document chunks (source file path is in :source)
-(def chunks (unwrap! (db/search-chunks ctx q 5)))
-;; => [{:source "src/loom/db.clj" :summary "..." :content "..."} ...]
-
-;; Events (findings, conclusions, approvals)
-(def events (unwrap! (db/search-events ctx q 10)))
-;; => [{:type "finding|conclusion|approval" :content "..." :agent-id "..."} ...]
+# Events (findings, conclusions, approvals)
+python3 ~/Projects/loom/loom_eval.py '(let [q (unwrap! (embedder/embed ctx "QUERY"))] (unwrap! (db/search-events ctx q 10)))'
 ```
 
 ---
 
-## Write findings / conclusions / approvals
+### loom/log-fact!
 
-```clojure
-(db/log-event! ctx {:type       "finding"      ; or "conclusion" "approval" "rejection"
-                    :content    "what you found"
-                    :session-id (:session-id ctx)
-                    :agent-id   "finder"})      ; or "analyzer" "reviewer" etc.
+Write a discovery to session memory.
+
+```bash
+python3 ~/Projects/loom/loom_eval.py '(unwrap! (session/log-fact! ctx "FACT"))'
 ```
 
 ---
 
-## Session memory
+### loom/promote!
 
-```clojure
-(require '[loom.session :as session])
+Promote a stable fact to global memory (persists across sessions).
 
-;; Write a fact scoped to this session
-(unwrap! (session/log-fact! ctx "The API uses cursor-based pagination via :next_cursor."))
-
-;; Read it back (plain text, no embed needed)
-(unwrap! (session/search-facts ctx "pagination" 3))
+```bash
+python3 ~/Projects/loom/loom_eval.py '(unwrap! (memory/promote! ctx "FACT" {:tags ["TAG"] :type :stable}))'
 ```
 
 ---
 
-## Global memory (persist across sessions)
+### loom/log-finding!
 
-```clojure
-(require '[loom.memory :as memory])
+Log a finding event (call after each major discovery).
 
-;; Promote a stable fact to global memory
-(unwrap! (memory/promote! ctx "Service X always runs on port 9090."
-                          {:tags ["infra"] :type :stable}))
+```bash
+python3 ~/Projects/loom/loom_eval.py '(db/log-event! ctx {:type "finding" :content "CONTENT" :session-id (:session-id ctx) :agent-id "AGENT_ID" :goal-id "GOAL_ID"})'
+```
 
-;; Search global memory (requires embed)
-(unwrap! (db/search-facts ctx q 5))
+Omit `:goal-id` if no active goal.
+
+---
+
+### loom/log-conclusion!
+
+Log a conclusion event.
+
+```bash
+python3 ~/Projects/loom/loom_eval.py '(db/log-event! ctx {:type "conclusion" :content "CONTENT" :session-id (:session-id ctx) :agent-id "loom" :goal-id "GOAL_ID"})'
 ```
 
 ---
 
-## Register a new tool
+### loom/log-approval!
 
-```clojure
-(require '[loom.tools :as tools])
+Log a reviewer approval.
 
-(defn ^{:doc "One-line description." :tags ["tag1" "tag2"]}
-  my-tool [ctx arg]
-  (loom.envelope/with-provenance "my-tool" 1
-    ;; implementation — must return a plain value, with-provenance wraps it
-    (str "result: " arg)))
-
-(unwrap! (tools/register! ctx #'my-tool))
-;; Tool is now searchable via db/search-tools and persists across sessions
+```bash
+python3 ~/Projects/loom/loom_eval.py '(db/log-event! ctx {:type "approval" :content "CONTENT" :session-id (:session-id ctx) :agent-id "reviewer" :goal-id "GOAL_ID"})'
 ```
 
 ---
 
-## Ingest project files
+### loom/log-rejection!
 
-```clojure
-(require '[loom.init :as init])
+Log a reviewer rejection.
 
-;; Index all source files in CWD into chunks (idempotent, skips already-indexed)
-(unwrap! (init/run! ctx))
+```bash
+python3 ~/Projects/loom/loom_eval.py '(db/log-event! ctx {:type "rejection" :content "CONTENT" :session-id (:session-id ctx) :agent-id "reviewer" :goal-id "GOAL_ID"})'
 ```
 
 ---
 
-## Fetch / filesystem helpers
+### loom/active-goal
 
-```clojure
-;; HTTP
-(def body (unwrap! (loom.seed.http/fetch ctx "https://example.com/api")))
+Get the current active goal (returns nil if none).
 
-;; Files
-(def text (unwrap! (loom.seed.fs/read-file ctx "/path/to/file")))
-(def entries (unwrap! (loom.seed.fs/list-dir ctx "/path/to/dir")))
+```bash
+python3 ~/Projects/loom/loom_eval.py '(unwrap! (loom.goals/active ctx))'
+```
+
+---
+
+### loom/create-goal!
+
+Create a parent goal and return its id into `gid`.
+
+```bash
+python3 ~/Projects/loom/loom_eval.py '(def gid (unwrap! (loom.goals/create-goal! ctx {:title "TITLE" :description "DESCRIPTION" :status "active"})))'
+```
+
+---
+
+### loom/create-subgoal!
+
+Create a sub-goal linked to a parent.
+
+```bash
+python3 ~/Projects/loom/loom_eval.py '(unwrap! (loom.goals/create-goal! ctx {:title "TITLE" :parent-id gid :status "open"}))'
+```
+
+---
+
+### loom/close-goal!
+
+Mark a goal done.
+
+```bash
+python3 ~/Projects/loom/loom_eval.py '(unwrap! (loom.goals/update-status! ctx gid "done"))'
+```
+
+---
+
+### loom/register-tool!
+
+Define and register a new reusable tool.
+
+```bash
+python3 ~/Projects/loom/loom_eval.py '
+(defn ^{:doc "DESCRIPTION" :tags ["TAG"]}
+  TOOL_NAME [ctx ARG]
+  (loom.envelope/with-provenance "TOOL_NAME" 1
+    BODY))
+(unwrap! (tools/register! ctx #'"'"'TOOL_NAME))
+'
 ```
 
 ---
 
 ## Envelope rules
 
-- **Always** call `unwrap!` on any Loom return value before using it as data.
-- On error `unwrap!` throws — catch with `try/catch ex-info` if you want to handle gracefully.
+- Always call `unwrap!` on any Loom return value before using it as data.
+- On error `unwrap!` throws — the error message describes what failed.
 - `(:provenance result-env)` contains `:op`, `:duration-ms`, `:version` for debugging.

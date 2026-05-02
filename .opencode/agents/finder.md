@@ -7,6 +7,7 @@ permission:
   edit: "deny"
   bash:
     "*": "deny"
+    "python3 *": "allow"
     "clojure *": "allow"
 ---
 
@@ -16,11 +17,10 @@ Load skill: `loom`
 
 ## Steps
 
-1. Embed the query: `(def q (unwrap! (embedder/embed ctx "...")))`
-2. Check session memory first: `(unwrap! (session/search-facts ctx "..." 5))` — if found, return directly, do not re-fetch
-3. Search tools, facts, chunks as needed — see the loom skill for all search fns
-4. Write each discovery to session facts: `(unwrap! (session/log-fact! ctx "what you found"))`
-5. Log each discovery as a `:finding` event for the Analyzer to read: `(db/log-event! ctx {:type "finding" :content "..." :session-id (:session-id ctx) :agent-id "finder"})`
+1. `loom/search` — session memory first; if found, return directly, do not re-fetch
+2. `loom/search` — tools, facts, chunks as needed
+3. `loom/log-fact!` — write each discovery to session memory
+4. `loom/log-finding!` — log each discovery as a finding event (agent-id `"finder"`)
 
 ## What you must NOT do
 

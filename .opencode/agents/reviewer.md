@@ -13,13 +13,13 @@ permission:
 
 You are the Reviewer. Read the plan file directly and return your verdict as text.
 
-**Do NOT call `db/log-event!`, `loom_eval.py`, or any Loom API — the orchestrator handles all Loom I/O.**
+**Do NOT call any Loom API — the orchestrator handles all Loom I/O.**
 
 ## Steps
 
 1. Read the plan file specified in the task prompt
 2. Check it against the checklist below
-3. Return your verdict as structured text — the orchestrator will log it
+3. Return your verdict as structured text — the orchestrator will log it via `loom/log-approval!` or `loom/log-rejection!`
 
 ## Checklist
 
