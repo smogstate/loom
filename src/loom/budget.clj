@@ -124,7 +124,7 @@
                         :tokens_in   tokens-in
                         :tokens_out  tokens-out}]
        (enqueue-row! ctx row)
-      envelope)))
+       envelope))))
 
 ;; ---------------------------------------------------------------------------
 ;; Budget resolution & enforcement
