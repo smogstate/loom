@@ -2,7 +2,10 @@
   "Agent performance dashboard — DuckDB queries over events, goals, and usage parquet files."
   (:require [clojure.pprint :as pp]
             [loom.db :as db]
-            [loom.envelope :refer [with-provenance]]))
+            [loom.envelope :refer [with-provenance unwrap!]]))
+
+(defn- unwrap-metric  [env] (when (:ok? env) (:result env)))
+(defn- unwrap-metrics [env] (when (:ok? env) (vec (:result env))))
 
 ;; ---------------------------------------------------------------------------
 ;; Helpers
@@ -140,22 +143,31 @@
 ;; Dashboard
 ;; ---------------------------------------------------------------------------
 
+(defn dashboard-data
+  "Return all metrics as a plain map (JSON-serialisable, no printing).
+   Keys are string names for easy JSON output."
+  {:doc "Return agent performance metrics: goals, events, failures, usage, cost, search."
+   :tags ["metrics" "dashboard" "performance" "agents"]}
+  [ctx]
+  (with-provenance "loom.metrics/dashboard-data" 1
+    {"goal-completion"     (unwrap-metric (goal-completion-rate ctx))
+     "time-to-completion"  (unwrap-metric (avg-time-to-completion ctx))
+     "event-breakdown"     (unwrap-metrics (event-breakdown ctx))
+     "failure-rate"        (unwrap-metrics (failure-rate ctx))
+     "goals-with-failures" (unwrap-metric (goals-with-failures ctx))
+     "usage-summary"       (unwrap-metrics (usage-summary ctx))
+     "cost-per-goal"       (unwrap-metric (cost-per-goal ctx))
+     "slowest-ops"         (unwrap-metrics (slowest-ops ctx))
+     "search-call-counts"  (unwrap-metrics (search-call-counts ctx))}))
+
 (defn dashboard
-  "Print a full performance dashboard to stdout. Returns a map of all metrics."
+  "Print a full performance dashboard to stdout. Returns the metrics map."
   [ctx]
   (with-provenance "loom.metrics/dashboard" 1
-    (let [metrics {:goal-completion    (goal-completion-rate ctx)
-                   :time-to-completion (avg-time-to-completion ctx)
-                   :event-breakdown    (event-breakdown ctx)
-                   :failure-rate       (failure-rate ctx)
-                   :goals-with-failures (goals-with-failures ctx)
-                   :usage-summary      (usage-summary ctx)
-                   :cost-per-goal      (cost-per-goal ctx)
-                   :slowest-ops        (slowest-ops ctx)
-                   :search-call-counts (search-call-counts ctx)}]
+    (let [metrics (unwrap! (dashboard-data ctx))]
       (println "\n=== LOOM AGENT PERFORMANCE DASHBOARD ===\n")
       (doseq [[k v] metrics]
-        (println (str "\n--- " (name k) " ---"))
+        (println (str "\n--- " k " ---"))
         (pp/pprint v))
       (println "\n=========================================\n")
       metrics)))
