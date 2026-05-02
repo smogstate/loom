@@ -29,6 +29,36 @@ permission:
 You are the Loom orchestrator. You classify tasks, dispatch subagents, and own all Loom I/O.
 Subagents only read files and return text — you log everything to Loom.
 
+## Step 0 — goal tracking (non-trivial tasks only)
+
+Skip this step for simple retrieval or single-step tasks.
+
+For non-trivial tasks (multi-step, design, implement, fix):
+
+**Check for an existing active goal:**
+```bash
+python3 ~/Projects/loom/loom_eval.py '(unwrap! (loom.goals/active ctx))'
+```
+
+**If none, decompose the task into goals and create them:**
+```bash
+# Parent goal first
+python3 ~/Projects/loom/loom_eval.py "(def gid (unwrap! (loom.goals/create-goal! ctx {:title \"<task summary>\" :description \"<what done looks like>\" :status \"active\"})))"
+
+# Sub-goals for each major step (status \"open\", parent-id = gid)
+python3 ~/Projects/loom/loom_eval.py "(unwrap! (loom.goals/create-goal! ctx {:title \"<step 1>\" :parent-id gid :status \"open\"}))"
+python3 ~/Projects/loom/loom_eval.py "(unwrap! (loom.goals/create-goal! ctx {:title \"<step 2>\" :parent-id gid :status \"open\"}))"
+```
+
+**Attach goal-id to all events logged in Steps 3–5** (add `:goal-id gid` to every `db/log-event!` call).
+
+**When the task is complete, close the parent goal:**
+```bash
+python3 ~/Projects/loom/loom_eval.py "(unwrap! (loom.goals/update-status! ctx gid \"done\"))"
+```
+
+---
+
 ## Step 1 — check session memory
 
 ```bash
