@@ -3,7 +3,8 @@
   (:require [clojure.string :as str]
             [loom.db :as db]
             [loom.embedder :as embedder]
-            [loom.envelope :refer [with-provenance unwrap!]])
+            [loom.envelope :refer [with-provenance unwrap!]]
+            [loom.scope :as scope :refer [GLOBAL_SID]])
   (:import [org.apache.commons.text.similarity JaroWinklerSimilarity]))
 
 (def ^:private allowed-cascade-predicates
@@ -34,86 +35,111 @@
        (>= (double (or (:confidence e) 0.0)) promotion-min-confidence)
        (>= (distinct-session-count (:source_sessions e)) 2)))
 
+(defn- ->stack
+  "Resolve a session-stack from public-API opts.
+   Public API accepts :session-ids (vector) and optional :strict?.
+   Falls back to (default-stack ctx) when both are absent."
+  [ctx {:keys [session-ids strict?]}]
+  (if (some? session-ids)
+    (scope/normalize-stack session-ids :strict? (boolean strict?))
+    (scope/default-stack ctx)))
+
 (defn upsert-entity!
-  "Envelope-wrapped entity upsert.
+  "Envelope-wrapped entity upsert. Write path — single session target.
    opts: {:scope :session|:global :session-id sid}."
   [ctx entity opts]
   (with-provenance "loom.graph/upsert-entity!" 1
     (unwrap! (db/db-upsert-entity! ctx entity opts))))
 
 (defn upsert-relation!
-  "Envelope-wrapped relation upsert.
+  "Envelope-wrapped relation upsert. Write path — single session target.
    opts: {:scope :session|:global :session-id sid}."
   [ctx relation opts]
   (with-provenance "loom.graph/upsert-relation!" 1
     (unwrap! (db/db-upsert-relation! ctx relation opts))))
 
 (defn search-entities
-  "Semantic search entities session-first then global."
-  [ctx query k & {:keys [session-id kind]}]
+  "Semantic search entities across the supplied stack.
+   opts: {:session-ids [sid…] :strict? bool :kind k}."
+  [ctx query k & {:keys [session-ids strict? kind] :as opts}]
   (with-provenance "loom.graph/search-entities" 1
-    (let [vec (unwrap! (embedder/embed ctx query))]
-      (unwrap! (db/db-search-entities ctx vec k {:session-id session-id :kind kind})))))
+    (let [stack (->stack ctx opts)
+          vec   (unwrap! (embedder/embed ctx query))]
+      (unwrap! (db/db-search-entities ctx vec k {:session-ids stack :kind kind})))))
 
 (defn search-entities-by-name
-  "Prefix search over entities by canonical_name (case-insensitive). No embedding required."
-  [ctx name-prefix & {:keys [session-id limit kind]}]
+  "Prefix search over entities by canonical_name (case-insensitive).
+   opts: {:session-ids [sid…] :strict? bool :limit n :kind k}."
+  [ctx name-prefix & {:keys [session-ids strict? limit kind] :as opts}]
   (with-provenance "loom.graph/search-entities-by-name" 1
-    (unwrap! (db/db-search-entities-by-name ctx name-prefix
-                                             {:session-id session-id
-                                              :limit (or limit 20)
-                                              :kind kind}))))
+    (let [stack (->stack ctx opts)]
+      (unwrap! (db/db-search-entities-by-name ctx name-prefix
+                                              {:session-ids stack
+                                               :limit (or limit 20)
+                                               :kind kind})))))
 
 (defn search-relations
-  "Search relations with optional filters."
-  [ctx & {:keys [session-id subject-id object-id predicate limit]}]
+  "Search relations with optional filters.
+   opts: {:session-ids [sid…] :strict? bool :subject-id s :object-id o :predicate p :limit n}."
+  [ctx & {:keys [session-ids strict? subject-id object-id predicate limit] :as opts}]
   (with-provenance "loom.graph/search-relations" 1
-    (unwrap! (db/db-search-relations ctx {:session-id session-id
-                                          :subject-id subject-id
-                                          :object-id object-id
-                                          :predicate predicate
-                                          :limit (or limit 200)}))))
+    (let [stack (->stack ctx opts)]
+      (unwrap! (db/db-search-relations ctx {:session-ids stack
+                                            :subject-id subject-id
+                                            :object-id object-id
+                                            :predicate predicate
+                                            :limit (or limit 200)})))))
 
 (defn neighbors
-  "Return one-hop neighbors from graph relations."
-  [ctx entity-id & {:keys [session-id direction predicates limit]}]
+  "Return one-hop neighbors from graph relations.
+   opts: {:session-ids [sid…] :strict? bool :direction :out|:in|:both :predicates [..] :limit n}."
+  [ctx entity-id & {:keys [session-ids strict? direction predicates limit] :as opts}]
   (with-provenance "loom.graph/neighbors" 1
-    (unwrap! (db/db-neighbors ctx entity-id {:session-id session-id
-                                             :direction (or direction :out)
-                                             :predicates predicates
-                                             :limit (or limit 100)}))))
+    (let [stack (->stack ctx opts)]
+      (unwrap! (db/db-neighbors ctx entity-id {:session-ids stack
+                                               :direction (or direction :out)
+                                               :predicates predicates
+                                               :limit (or limit 100)})))))
 
 (defn bfs
-  "Breadth-first traversal from start entity id."
-  [ctx start-id & {:keys [session-id max-depth limit undirected?]}]
+  "Breadth-first traversal from start entity id.
+   opts: {:session-ids [sid…] :strict? bool :max-depth n :limit n :undirected? bool}."
+  [ctx start-id & {:keys [session-ids strict? max-depth limit undirected?] :as opts}]
   (with-provenance "loom.graph/bfs" 1
-    (unwrap! (db/db-bfs ctx start-id {:session-id session-id
-                                      :max-depth (or max-depth 3)
-                                      :limit (or limit 200)
-                                       :undirected? (boolean undirected?)}))))
+    (let [stack (->stack ctx opts)]
+      (unwrap! (db/db-bfs ctx start-id {:session-ids stack
+                                        :max-depth (or max-depth 3)
+                                        :limit (or limit 200)
+                                        :undirected? (boolean undirected?)})))))
 
 (defn subgraph
   "Return {:nodes [entity...] :edges [relation...]} for a BFS subgraph from start-id.
    Single call; SQL query count ≤ 3 regardless of graph size.
-   opts: {:session-id s :max-depth n :direction :out/:in/:both}."
+   opts: {:session-ids [sid…] :strict? bool :max-depth n :direction :out/:in/:both}."
   [ctx start-id opts]
   (with-provenance "loom.graph/subgraph" 1
-    (unwrap! (db/db-subgraph ctx start-id opts))))
+    (let [stack (->stack ctx opts)]
+      (unwrap! (db/db-subgraph ctx start-id (assoc opts :session-ids stack))))))
 
 (defn neighbor-counts
-  "Return {:in n :out n} degree counts for an entity. Uses COUNT(*) SQL — no entity hydration."
-  [ctx entity-id & {:keys [session-id]}]
+  "Return {:in n :out n} degree counts for an entity. Uses COUNT(*) SQL — no entity hydration.
+   opts: {:session-ids [sid…] :strict? bool}."
+  [ctx entity-id & {:keys [session-ids strict?] :as opts}]
   (with-provenance "loom.graph/neighbor-counts" 1
-    (unwrap! (db/db-neighbor-counts ctx entity-id {:session-id session-id}))))
+    (let [stack (->stack ctx opts)]
+      (unwrap! (db/db-neighbor-counts ctx entity-id {:session-ids stack})))))
 
 (defn resolve-entity!
   "Resolve a candidate entity against existing entities in scope.
-   Returns {:resolved-id id :action :existing|:created}."
+   Returns {:resolved-id id :action :existing|:created}.
+   Read uses session-only stack (`[session-id] :strict? true`); write opts unchanged."
   [ctx {:keys [canonical_name kind] :as candidate} {:keys [scope session-id] :or {scope :session}}]
   (with-provenance "loom.graph/resolve-entity!" 1
-    (let [name-text (or canonical_name "")
+    (let [sid       (or session-id (:session-id ctx))
+          read-stack (scope/normalize-stack [sid] :strict? true)
+          name-text (or canonical_name "")
           vec (or (:vector candidate) (unwrap! (embedder/embed ctx name-text)))
-          cands (unwrap! (db/db-search-entities ctx vec 10 {:session-id session-id :kind kind}))
+          cands (unwrap! (db/db-search-entities ctx vec 10 {:session-ids read-stack :kind kind}))
           winner (first
                   (filter (fn [e]
                             (and (= (:kind e) (name kind))
@@ -138,17 +164,20 @@
    IMPLEMENTS/USES/DEPENDS_ON predicates."
   [ctx entity-id & {:keys [session-id cascade?] :or {cascade? true}}]
   (with-provenance "loom.graph/promote-entity!" 1
-    (let [sid (or session-id (:session-id ctx))
-          e (unwrap! (db/db-get-entity ctx entity-id sid))]
+    (let [sid        (or session-id (:session-id ctx))
+          read-stack (scope/normalize-stack [sid] :strict? true)
+          e (unwrap! (db/db-get-entity ctx entity-id read-stack))]
       (when-not e
         (throw (ex-info "entity not found for promotion" {:entity-id entity-id :session-id sid})))
       (let [global-id (unwrap! (db/db-upsert-entity! ctx (assoc e :id (:id e)) {:scope :global}))]
         (when cascade?
-          (let [rels (unwrap! (db/db-search-relations ctx {:session-id sid :subject-id entity-id :limit 500}))]
+          (let [rels (unwrap! (db/db-search-relations ctx {:session-ids read-stack
+                                                           :subject-id entity-id
+                                                           :limit 500}))]
             (doseq [r rels]
               (let [predicate (:predicate r)]
                 (when (contains? allowed-cascade-predicates predicate)
-                  (let [obj (unwrap! (db/db-get-entity ctx (:object_id r) sid))]
+                  (let [obj (unwrap! (db/db-get-entity ctx (:object_id r) read-stack))]
                     (when obj
                       (unwrap! (db/db-upsert-entity! ctx obj {:scope :global}))
                       (unwrap! (db/db-upsert-relation! ctx
@@ -161,7 +190,8 @@
   [ctx & {:keys [session-id]}]
   (with-provenance "loom.graph/auto-promote!" 1
     (let [sid (or session-id (:session-id ctx))
-          entities (unwrap! (db/db-list-entities ctx {:scope :session :session-id sid :limit 1000}))
+          read-stack (scope/normalize-stack [sid] :strict? true)
+          entities (unwrap! (db/db-list-entities ctx {:session-ids read-stack :limit 1000}))
           eligible (filter entity-eligible-for-promotion? entities)
           promoted (mapv (fn [e]
                            (unwrap! (promote-entity! ctx (:id e)

@@ -71,7 +71,8 @@
     (let [updated-id (unwrap! (db/update-goal-status! ctx goal-id status))]
       (when (= status "done")
         (let [rels (unwrap! (graph/bfs ctx goal-id
-                                      :session-id (:session-id ctx)
+                                      :session-ids [(:session-id ctx)]
+                                      :strict? true
                                       :max-depth 4
                                       :limit 500
                                       :undirected? false))]
@@ -90,14 +91,17 @@
     (unwrap! (db/link-event-to-goal! ctx event-id goal-id))))
 
 (defn open-goals
-  "List goals with status in #{open active blocked} for the current session
-   (or all sessions when :scope :global is passed).
-   Returns a seq of goal maps."
-  [ctx & {:keys [scope] :or {scope :session}}]
+  "List goals with status in #{open active blocked} for the current session.
+   Pass :session-ids to override (e.g. multi-session view); :strict? true to
+   exclude global. Default: current session + global tail."
+  [ctx & {:keys [session-ids strict?]}]
   (with-provenance "loom.goals/open-goals" 1
-    (unwrap! (db/list-goals ctx {:scope      scope
-                                 :session-id (:session-id ctx)
-                                 :statuses   ["open" "active" "blocked"]}))))
+    (let [stack (if (some? session-ids)
+                  session-ids
+                  [(:session-id ctx)])]
+      (unwrap! (db/list-goals ctx {:session-ids stack
+                                   :strict?     (boolean strict?)
+                                   :statuses    ["open" "active" "blocked"]})))))
 
 (defn active
   "Return the single active goal for this session, or nil.

@@ -2,6 +2,7 @@
   (:require [clojure.test :refer [deftest is testing use-fixtures]]
             [loom.db :as db]
             [loom.graph :as graph]
+            [loom.scope :as scope :refer [GLOBAL_SID]]
             [loom.envelope :refer [unwrap!]])
   (:import [java.nio.file Files]
            [java.nio.file.attribute FileAttribute]))
@@ -26,6 +27,11 @@
 (defn- v [x]
   (vec (repeat 768 x)))
 
+(defn- stack
+  "Convenience: build a normalised read-stack ending in GLOBAL_SID."
+  [& sids]
+  (scope/normalize-stack (vec sids)))
+
 (deftest entity-upsert-and-session-first-lookup
   (let [eid "entity-1"]
     (unwrap! (db/db-upsert-entity! *ctx*
@@ -36,9 +42,9 @@
              {:id eid :canonical_name "session-name" :kind "concept" :vector (v 0.2)
               :confidence 0.95 :source_sessions ["s1"]}
              {:scope :session :session-id "s1"}))
-    (let [hit (unwrap! (db/db-get-entity *ctx* eid "s1"))]
+    (let [hit (unwrap! (db/db-get-entity *ctx* eid (stack "s1")))]
       (is (= "session-name" (:canonical_name hit))))
-    (let [fallback (unwrap! (db/db-get-entity *ctx* eid "other-session"))]
+    (let [fallback (unwrap! (db/db-get-entity *ctx* eid (stack "other-session")))]
       (is (= "global-name" (:canonical_name fallback))))))
 
 (deftest relation-upsert-and-search
@@ -48,7 +54,10 @@
            {:subject_id "a" :predicate "USES" :object_id "b" :confidence 1.0
             :source_id "src1" :source_table "facts" :source_sessions ["s1"]}
            {:scope :global}))
-  (let [rels (unwrap! (db/db-search-relations *ctx* {:subject-id "a" :predicate "USES" :limit 10}))]
+  (let [rels (unwrap! (db/db-search-relations *ctx* {:session-ids (stack)
+                                                     :subject-id "a"
+                                                     :predicate "USES"
+                                                     :limit 10}))]
     (is (= 1 (count rels)))
     (is (= "b" (:object_id (first rels))))))
 
@@ -67,11 +76,12 @@
   (let [noop (unwrap! (db/db-merge-entities! *ctx* "e2" "e2" {:scope :global}))]
     (is (false? (:merged noop))))
 
-  (let [merged (unwrap! (db/db-merge-entities! *ctx* "e1" "e2" {:scope :global}))
-        e1     (unwrap! (db/db-get-entity *ctx* "e1" nil))
-        e2     (unwrap! (db/db-get-entity *ctx* "e2" nil))
-        rels-e1 (unwrap! (db/db-search-relations *ctx* {:subject-id "e1" :limit 10}))
-        rels-e2 (unwrap! (db/db-search-relations *ctx* {:subject-id "e2" :limit 10}))]
+  (let [merged  (unwrap! (db/db-merge-entities! *ctx* "e1" "e2" {:scope :global}))
+        gstack  (stack)
+        e1      (unwrap! (db/db-get-entity *ctx* "e1" gstack))
+        e2      (unwrap! (db/db-get-entity *ctx* "e2" gstack))
+        rels-e1 (unwrap! (db/db-search-relations *ctx* {:session-ids gstack :subject-id "e1" :limit 10}))
+        rels-e2 (unwrap! (db/db-search-relations *ctx* {:session-ids gstack :subject-id "e2" :limit 10}))]
     (is (true? (:merged merged)))
     (is (nil? e1))
     (is (>= (:source_count e2) 2))
@@ -87,7 +97,8 @@
                                             :confidence 1.0 :source_id (str s "->" o)
                                             :source_table "facts" :source_sessions ["s1"]}
              {:scope :global})))
-  (let [walk (unwrap! (db/db-bfs *ctx* "n1" {:max-depth 4 :limit 20 :undirected? false}))
+  (let [walk (unwrap! (db/db-bfs *ctx* "n1" {:session-ids (stack)
+                                             :max-depth 4 :limit 20 :undirected? false}))
         ids  (set (map :node_id walk))]
     (is (= #{"n1" "n2" "n3"} ids))))
 
@@ -97,7 +108,7 @@
                                         :source_count 2 :source_sessions ["s1" "s2"]}
            {:scope :session :session-id "s1"}))
   (let [res (unwrap! (graph/auto-promote! *ctx* :session-id "s1"))
-        g   (unwrap! (db/db-get-entity *ctx* "p1" nil))]
+        g   (unwrap! (db/db-get-entity *ctx* "p1" (stack)))]
     (is (= 1 (:eligible res)))
     (is (= "promotable" (:canonical_name g)))))
 
@@ -109,8 +120,8 @@
         _ (unwrap! (db/save-session-fact! *ctx* {:id "sf1" :agent-id "agent"
                                                  :content "session fact" :vector v1}))
         mig (unwrap! (db/migrate-facts-to-graph! *ctx*))
-        ge  (unwrap! (db/db-get-entity *ctx* "f1" nil))
-        se  (unwrap! (db/db-get-entity *ctx* "sf1" "s1"))]
+        ge  (unwrap! (db/db-get-entity *ctx* "f1" (stack)))
+        se  (unwrap! (db/db-get-entity *ctx* "sf1" (stack "s1")))]
     (is (= 1 (:global mig)))
     (is (= "global fact" (:canonical_name ge)))
     (is (= "session fact" (:canonical_name se)))))

@@ -1,0 +1,437 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Loom — KG Traversal</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/cytoscape/3.28.1/cytoscape.min.js"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --bg: #0f1117; --surface: #1a1d27; --surface2: #22263a;
+      --border: #2e3347; --accent: #4A90D9; --accent2: #5CB85C;
+      --text: #d4d8e8; --text-dim: #7a8099; --danger: #e05c5c;
+      --radius: 6px; --toolbar-h: 52px; --inspector-w: 320px;
+    }
+    html, body { height: 100%; background: var(--bg); color: var(--text);
+      font-family: 'Inter', system-ui, sans-serif; font-size: 14px; overflow: hidden; }
+    #app { display: flex; flex-direction: column; height: 100vh; }
+
+    /* topbar */
+    #topbar { display: flex; align-items: center; gap: 10px; padding: 0 14px;
+      height: var(--toolbar-h); background: var(--surface);
+      border-bottom: 1px solid var(--border); flex-shrink: 0; z-index: 20; }
+    .logo { font-weight: 700; font-size: 16px; color: var(--accent); }
+    .search-wrap { position: relative; flex: 1; max-width: 480px; }
+    .search-wrap input { width: 100%; padding: 7px 12px; background: var(--surface2);
+      border: 1px solid var(--border); border-radius: var(--radius);
+      color: var(--text); font-size: 13px; }
+    .search-wrap input:focus { outline: none; border-color: var(--accent); }
+    .search-wrap input::placeholder { color: var(--text-dim); }
+    #search-dropdown { position: absolute; top: calc(100% + 4px); left: 0; right: 0;
+      background: var(--surface2); border: 1px solid var(--border);
+      border-radius: var(--radius); max-height: 260px; overflow-y: auto;
+      z-index: 100; box-shadow: 0 8px 24px rgba(0,0,0,0.5); display: none; }
+    #search-dropdown.open { display: block; }
+    .result-item { display: flex; align-items: center; gap: 8px; padding: 8px 12px;
+      cursor: pointer; }
+    .result-item:hover { background: var(--surface); }
+    .r-label { flex: 1; font-size: 13px; }
+    .r-kind { font-size: 10px; padding: 2px 6px; border-radius: 10px;
+      background: var(--border); color: var(--text-dim); text-transform: uppercase; }
+    .no-results { padding: 10px 12px; color: var(--text-dim); font-size: 12px; }
+    .health-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--text-dim); }
+    .health-dot.ok { background: var(--accent2); }
+    .health-dot.err { background: var(--danger); }
+
+    /* toolbar */
+    #toolbar { display: flex; align-items: center; gap: 8px; padding: 0 14px;
+      height: 40px; background: var(--surface); border-bottom: 1px solid var(--border);
+      flex-shrink: 0; }
+    .btn { padding: 5px 12px; background: var(--surface2); border: 1px solid var(--border);
+      border-radius: var(--radius); color: var(--text); font-size: 12px; cursor: pointer; }
+    .btn:hover { background: var(--border); border-color: var(--accent); }
+    .btn.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+    #node-count { margin-left: auto; font-size: 11px; color: var(--text-dim); }
+
+    /* main */
+    #main { display: flex; flex: 1; overflow: hidden; position: relative; }
+    #cy { flex: 1; background: var(--bg); }
+
+    /* empty state */
+    #empty-state { position: absolute; inset: 0; display: flex; flex-direction: column;
+      align-items: center; justify-content: center; gap: 10px;
+      pointer-events: none; color: var(--text-dim); }
+    #empty-state .es-icon { font-size: 48px; opacity: 0.3; }
+    #empty-state .es-text { font-size: 14px; opacity: 0.5; }
+
+    /* inspector */
+    #inspector { position: absolute; top: 0; right: 0; bottom: 0;
+      width: var(--inspector-w); background: var(--surface);
+      border-left: 1px solid var(--border); display: flex; flex-direction: column;
+      transform: translateX(100%); transition: transform 0.22s ease; z-index: 10; }
+    #inspector.open { transform: translateX(0); }
+    .insp-header { display: flex; align-items: flex-start; justify-content: space-between;
+      padding: 14px; border-bottom: 1px solid var(--border); gap: 8px; }
+    .insp-name { font-size: 15px; font-weight: 600; word-break: break-all; flex: 1; }
+    .close-btn { background: none; border: none; color: var(--text-dim);
+      font-size: 18px; cursor: pointer; }
+    .insp-body { flex: 1; overflow-y: auto; padding: 12px 14px; }
+    .insp-footer { padding: 12px 14px; border-top: 1px solid var(--border); }
+    .btn-expand { width: 100%; padding: 8px; background: var(--accent); border: none;
+      border-radius: var(--radius); color: #fff; font-size: 13px; font-weight: 600; cursor: pointer; }
+    .meta-table { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 8px; }
+    .meta-table td { padding: 5px 6px; border-bottom: 1px solid var(--border); vertical-align: top; }
+    .meta-table td:first-child { color: var(--text-dim); white-space: nowrap; width: 35%; }
+    .sec-title { font-size: 11px; font-weight: 600; text-transform: uppercase;
+      letter-spacing: 0.08em; color: var(--text-dim); margin: 12px 0 4px; }
+    .degree-row { display: flex; gap: 10px; margin-top: 4px; }
+    .deg-card { flex: 1; background: var(--surface2); border: 1px solid var(--border);
+      border-radius: var(--radius); padding: 8px; text-align: center; }
+    .deg-val { font-size: 22px; font-weight: 700; color: var(--accent); }
+    .deg-label { font-size: 10px; color: var(--text-dim); text-transform: uppercase; }
+
+    ::-webkit-scrollbar { width: 6px; } ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+  </style>
+</head>
+<body>
+<div id="app">
+  <div id="topbar">
+    <span class="logo">⬡ Loom KG</span>
+    <div class="search-wrap">
+      <input id="search-input" type="text" placeholder="Search entities… (min 2 chars)" autocomplete="off" />
+      <div id="search-dropdown"></div>
+    </div>
+    <div style="flex:1"></div>
+    <div id="health-dot" class="health-dot" title="API status"></div>
+    <span id="health-label" style="font-size:11px;color:var(--text-dim)">…</span>
+  </div>
+
+  <div id="toolbar">
+    <button class="btn" id="btn-edge-labels">Edge Labels</button>
+    <button class="btn" id="btn-load-all">Load All</button>
+    <button class="btn" id="btn-fit">Fit</button>
+    <button class="btn" id="btn-clear" style="color:var(--danger)">Clear</button>
+    <span id="node-count">0 nodes · 0 edges</span>
+  </div>
+
+  <div id="main">
+    <div id="cy"></div>
+    <div id="empty-state">
+      <div class="es-icon">⬡</div>
+      <div class="es-text">Search for an entity to start exploring</div>
+    </div>
+    <div id="inspector">
+      <div class="insp-header">
+        <div class="insp-name" id="insp-name">—</div>
+        <button class="close-btn" id="insp-close">✕</button>
+      </div>
+      <div class="insp-body" id="insp-body"></div>
+      <div class="insp-footer">
+        <button class="btn-expand" id="btn-expand-here">⬡ Expand from here</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+const BASE = '';  // same origin
+
+// ── API ──────────────────────────────────────────────────────────────────────
+async function apiSearch(q, limit = 20) {
+  const r = await fetch(`${BASE}/api/search?q=${encodeURIComponent(q)}&limit=${limit}`);
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+async function apiSubgraph(rootId, depth = 2, direction = 'both') {
+  const r = await fetch(`${BASE}/api/subgraph?root_id=${encodeURIComponent(rootId)}&max_depth=${depth}&direction=${direction}`);
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+async function apiEntity(id) {
+  const r = await fetch(`${BASE}/api/entity/${encodeURIComponent(id)}`);
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+async function apiNeighborCounts(id) {
+  const r = await fetch(`${BASE}/api/neighbor-counts/${encodeURIComponent(id)}`);
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+// ── Cytoscape ────────────────────────────────────────────────────────────────
+const cy = cytoscape({
+  container: document.getElementById('cy'),
+  elements: [],
+  style: [
+    { selector: 'node', style: {
+      shape: 'ellipse', 'background-color': '#4A90D9', 'border-color': '#2c6fad', 'border-width': 2,
+      label: 'data(label)', color: '#f0f0f0', 'font-size': '11px',
+      'text-valign': 'center', 'text-halign': 'center',
+      'text-wrap': 'ellipsis', 'text-max-width': '90px',
+      width: 50, height: 50,
+    }},
+    { selector: 'node[kind = "fact"]',  style: { shape: 'diamond',   'background-color': '#5CB85C' }},
+    { selector: 'node[kind = "goal"]',  style: { shape: 'star',      'background-color': '#F0AD4E' }},
+    { selector: 'node[kind = "chunk"]', style: { shape: 'rectangle', 'background-color': '#9E9E9E' }},
+    { selector: 'node[kind = "event"]', style: { shape: 'hexagon',   'background-color': '#9B59B6' }},
+    { selector: 'node:selected', style: { 'border-color': '#fff', 'border-width': 3 }},
+    { selector: 'edge', style: {
+      width: 2, 'line-color': '#555e6e', 'target-arrow-color': '#555e6e',
+      'target-arrow-shape': 'triangle', 'curve-style': 'bezier',
+      label: 'data(label)', color: '#aab0bb', 'font-size': '9px',
+      'text-rotation': 'autorotate', 'text-opacity': 0,
+    }},
+  ],
+  layout: { name: 'grid' },
+  wheelSensitivity: 0.3,
+});
+
+// ── State ────────────────────────────────────────────────────────────────────
+const expanded = new Set();
+let edgeLabelsOn = false;
+let selectedId = null;
+
+function updateCounts() {
+  const nc = cy.nodes().length, ec = cy.edges().length;
+  document.getElementById('node-count').textContent = `${nc} nodes · ${ec} edges`;
+  document.getElementById('empty-state').style.display = nc === 0 ? 'flex' : 'none';
+}
+
+// ── Add subgraph data to cy ──────────────────────────────────────────────────
+function addSubgraph(data) {
+  const nodes = data.nodes || [];
+  const edges = data.edges || [];
+  const added = [];
+
+  for (const n of nodes) {
+    const id = n.id;
+    if (!id || cy.$id(id).length) continue;
+    added.push({ group: 'nodes', data: {
+      id,
+      label: n.canonical_name || id,
+      kind:  n.kind || 'unknown',
+      attrs: n.attrs || {},
+      source_sessions: n.source_sessions || [],
+    }});
+  }
+  for (const e of edges) {
+    const id = e.id, source = e.subject_id, target = e.object_id;
+    if (!id || !source || !target || cy.$id(id).length) continue;
+    added.push({ group: 'edges', data: { id, source, target, label: e.predicate || '' }});
+  }
+
+  if (added.length) {
+    console.log('addSubgraph: adding', added.length, 'elements');
+    const els = cy.add(added);
+    cy.layout({ name: 'cose', animate: true, animationDuration: 400, fit: true }).run();
+    updateCounts();
+    return els;
+  }
+  console.log('addSubgraph: nothing new to add');
+  updateCounts();
+  return cy.collection();
+}
+
+// ── Load subgraph for a root ─────────────────────────────────────────────────
+async function loadSubgraph(rootId, depth = 2) {
+  cy.elements().remove();
+  expanded.clear();
+  hideInspector();
+  try {
+    const data = await apiSubgraph(rootId, depth);
+    addSubgraph(data);
+    if (data.root_id) expanded.add(data.root_id);
+    (data.nodes || []).forEach(n => n.id && expanded.add(n.id));
+  } catch (err) {
+    console.error('loadSubgraph error:', err);
+  }
+}
+
+// ── Expand a node (depth=1) ──────────────────────────────────────────────────
+async function expandNode(nodeId) {
+  if (expanded.has(nodeId)) { console.log('expandNode: already expanded', nodeId); return; }
+  expanded.add(nodeId);
+  try {
+    console.log('expandNode: fetching', nodeId);
+    const data = await apiSubgraph(nodeId, 1);
+    console.log('expandNode: got', data.nodes?.length, 'nodes,', data.edges?.length, 'edges');
+    console.log('expandNode: edges', JSON.stringify(data.edges));
+    addSubgraph(data);
+  } catch (err) {
+    expanded.delete(nodeId);
+    console.error('expandNode error:', err);
+  }
+}
+
+// ── Inspector ────────────────────────────────────────────────────────────────
+function showInspector(nodeId) {
+  selectedId = nodeId;
+  const node = cy.getElementById(nodeId);
+  const d = node.data();
+  document.getElementById('insp-name').textContent = d.label || nodeId;
+  document.getElementById('inspector').classList.add('open');
+
+  const body = document.getElementById('insp-body');
+  body.innerHTML = '<div class="sec-title">Connectivity</div>'
+    + '<div class="degree-row">'
+    + `<div class="deg-card"><div class="deg-val">${node.indegree(false)}</div><div class="deg-label">In</div></div>`
+    + `<div class="deg-card"><div class="deg-val">${node.outdegree(false)}</div><div class="deg-label">Out</div></div>`
+    + '</div>';
+
+  // Async: fetch full entity details
+  apiEntity(nodeId).then(e => {
+    const attrs = e.attrs || {};
+    if (Object.keys(attrs).length === 0) return;
+    let rows = '';
+    for (const [k, v] of Object.entries(attrs)) {
+      const val = typeof v === 'object' ? JSON.stringify(v) : String(v);
+      rows += `<tr><td>${k}</td><td>${val}</td></tr>`;
+    }
+    body.innerHTML += '<div class="sec-title">Attributes</div>'
+      + `<table class="meta-table"><tbody>${rows}</tbody></table>`;
+  }).catch(() => {});
+
+  // Async: fetch live neighbor counts
+  apiNeighborCounts(nodeId).then(c => {
+    const inEl = body.querySelector('.deg-val:first-child');
+    // re-render degree row with live counts
+    const degRow = body.querySelector('.degree-row');
+    if (degRow) degRow.innerHTML =
+      `<div class="deg-card"><div class="deg-val">${c.in ?? '?'}</div><div class="deg-label">In</div></div>`
+      + `<div class="deg-card"><div class="deg-val">${c.out ?? '?'}</div><div class="deg-label">Out</div></div>`;
+  }).catch(() => {});
+}
+
+function hideInspector() {
+  document.getElementById('inspector').classList.remove('open');
+  selectedId = null;
+}
+
+// ── Cytoscape events ─────────────────────────────────────────────────────────
+cy.on('tap', 'node', evt => {
+  const id = evt.target.id();
+  showInspector(id);
+  expandNode(id);
+});
+cy.on('tap', evt => {
+  if (evt.target === cy) hideInspector();
+});
+cy.on('cxttap', 'node', evt => {
+  const nodeId = evt.target.id();
+  const visited = new Set(), queue = [nodeId];
+  while (queue.length) {
+    const cur = queue.shift();
+    if (visited.has(cur)) continue;
+    visited.add(cur);
+    cy.$id(cur).outgoers('node').forEach(n => queue.push(n.id()));
+  }
+  visited.delete(nodeId);
+  cy.nodes().filter(n => visited.has(n.id())).remove();
+  visited.forEach(id => expanded.delete(id));
+  updateCounts();
+});
+
+// ── Search ───────────────────────────────────────────────────────────────────
+let searchTimer = null;
+const searchInput = document.getElementById('search-input');
+const searchDropdown = document.getElementById('search-dropdown');
+
+searchInput.addEventListener('input', () => {
+  clearTimeout(searchTimer);
+  const q = searchInput.value.trim();
+  if (q.length < 2) { searchDropdown.classList.remove('open'); return; }
+  searchTimer = setTimeout(async () => {
+    searchDropdown.innerHTML = '<div class="no-results">Searching…</div>';
+    searchDropdown.classList.add('open');
+    try {
+      const data = await apiSearch(q);
+      const entities = data.entities || [];
+      if (entities.length === 0) {
+        searchDropdown.innerHTML = '<div class="no-results">No results.</div>';
+        return;
+      }
+      searchDropdown.innerHTML = entities.map(e =>
+        `<div class="result-item" data-id="${e.id}">
+          <span class="r-label">${e.label || e.canonical_name || e.id}</span>
+          <span class="r-kind">${e.kind || ''}</span>
+        </div>`
+      ).join('');
+      searchDropdown.querySelectorAll('.result-item').forEach(el => {
+        el.addEventListener('click', () => {
+          searchInput.value = el.querySelector('.r-label').textContent;
+          searchDropdown.classList.remove('open');
+          loadSubgraph(el.dataset.id);
+        });
+      });
+    } catch (err) {
+      searchDropdown.innerHTML = `<div class="no-results">Error: ${err.message}</div>`;
+    }
+  }, 300);
+});
+
+document.addEventListener('click', e => {
+  if (!e.target.closest('.search-wrap')) searchDropdown.classList.remove('open');
+});
+
+// ── Toolbar ──────────────────────────────────────────────────────────────────
+document.getElementById('btn-load-all').addEventListener('click', async function() {
+  this.textContent = 'Loading…';
+  this.disabled = true;
+  try {
+    cy.elements().remove();
+    expanded.clear();
+    hideInspector();
+    const data = await fetch('/api/all-entities').then(r => r.json());
+    const nodes = (data.entities || []).map(e => ({
+      group: 'nodes',
+      data: { id: e.id, label: e.label || e.canonical_name || e.id, kind: e.kind || 'unknown', attrs: e.attrs || {} }
+    }));
+    cy.add(nodes);
+    cy.layout({ name: 'cose', animate: true, animationDuration: 600, fit: true,
+      nodeRepulsion: 8000, idealEdgeLength: 80 }).run();
+    updateCounts();
+  } catch (err) {
+    alert('Failed to load all entities: ' + err.message);
+  } finally {
+    this.textContent = 'Load All';
+    this.disabled = false;
+  }
+});
+
+document.getElementById('btn-edge-labels').addEventListener('click', function() {
+  edgeLabelsOn = !edgeLabelsOn;
+  cy.edges().style('text-opacity', edgeLabelsOn ? 1 : 0);
+  this.classList.toggle('active', edgeLabelsOn);
+});
+document.getElementById('btn-fit').addEventListener('click', () => cy.fit(undefined, 40));
+document.getElementById('btn-clear').addEventListener('click', () => {
+  cy.elements().remove(); expanded.clear(); hideInspector(); updateCounts();
+});
+document.getElementById('insp-close').addEventListener('click', hideInspector);
+document.getElementById('btn-expand-here').addEventListener('click', async () => {
+  if (!selectedId) return;
+  expanded.delete(selectedId);
+  await expandNode(selectedId);
+  hideInspector();
+});
+
+// ── Health check ─────────────────────────────────────────────────────────────
+async function checkHealth() {
+  try {
+    const r = await fetch(`${BASE}/health`);
+    const ok = r.ok;
+    document.getElementById('health-dot').className = 'health-dot ' + (ok ? 'ok' : 'err');
+    document.getElementById('health-label').textContent = ok ? 'Connected' : 'Error';
+  } catch {
+    document.getElementById('health-dot').className = 'health-dot err';
+    document.getElementById('health-label').textContent = 'Disconnected';
+  }
+}
+checkHealth();
+setInterval(checkHealth, 30000);
+updateCounts();
+</script>
+</body>
+</html>

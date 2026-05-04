@@ -9,3 +9,17 @@ target/
 # IDE/LSP artifacts
 .clj-kondo/
 .lsp/
+
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Frontend build output / deps
+ui/dist/
+ui/react-app/dist/
+ui/react-app/node_modules/
+node_modules/
+
+# Vendored python (local-only install)
+ui/.packages/
+ui/.pip-bootstrap/

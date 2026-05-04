@@ -28,5 +28,6 @@
   [ctx query k]
   (with-provenance "loom.session/search-facts" 1
     (unwrap! (graph/search-entities ctx query k
-                                    :session-id (:session-id ctx)
+                                    :session-ids [(:session-id ctx)]
+                                    :strict? true
                                     :kind :concept))))

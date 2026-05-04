@@ -7,7 +7,8 @@
             [clojure.java.io :as io]
             [cheshire.core :as json]
             [clojure.core.async :as async]
-            [loom.envelope :refer [with-provenance unwrap!]])
+            [loom.envelope :refer [with-provenance unwrap!]]
+            [loom.scope :as scope :refer [GLOBAL_SID]])
   (:import [org.duckdb DuckDBConnection]
            [java.sql DriverManager ResultSet]))
 
@@ -929,18 +930,25 @@
                       goal-id))))))
 
 (defn list-goals
-  "opts: {:scope :session|:global :session-id sid :statuses [\"open\" ...]}"
-  [ctx {:keys [scope session-id statuses]}]
+  "List goals filtered by status and session stack.
+   `:session-ids` is a vector; rows whose session_id appears anywhere in
+   the (normalised) stack match. The goals store has no per-session priority
+   (a goal exists in exactly one session), so the stack acts as a *filter*,
+   not a priority ordering.
+   opts: {:session-ids [sid…] :strict? bool :statuses [\"open\" ...]}."
+  [ctx {:keys [session-ids strict? statuses]}]
   (with-provenance "loom.db/list-goals" 1
     (let [bad (remove valid-statuses statuses)]
       (when (seq bad)
         (throw (ex-info "Invalid goal status" {:invalid bad :allowed valid-statuses}))))
     (let [conn        (:conn ctx)
           path        (parquet-path (get-in ctx [:config :loom-dir]) :goals)
+          stack       (scope/normalize-stack session-ids :strict? (boolean strict?))
           status-list (str "(" (str/join "," (map #(str "'" % "'") statuses)) ")")
-          where       (cond-> (str "status IN " status-list)
-                        (= scope :session) (str " AND session_id = ?"))
-          params      (if (= scope :session) [session-id] [])]
+          sid-list    (str "(" (str/join "," (repeat (count stack) "?")) ")")
+          where       (str "status IN " status-list
+                           " AND session_id IN " sid-list)
+          params      (vec stack)]
       (if (.exists (io/file path))
         (apply query conn (str "SELECT * FROM read_parquet('" path "') WHERE " where
                                " ORDER BY created_at DESC") params)
@@ -1163,50 +1171,49 @@
     (if (.exists f) (.lastModified f) 0)))
 
 (defn- load-graph-scope!
-  "Load session-first then global graph data into in-memory union tables.
-   Uses mtime-based cache: no-op when parquet files haven't changed since last load."
-  [conn ctx session-id]
-  (let [spath-e (when session-id (session-entities-path ctx session-id))
-        spath-r (when session-id (session-relations-path ctx session-id))
-        gpath-e (entities-path ctx)
-        gpath-r (relations-path ctx)
-        cache-key [session-id gpath-e gpath-r]
-        cur-mtimes [(parquet-mtime gpath-e)
-                    (parquet-mtime gpath-r)
-                    (if spath-e (parquet-mtime spath-e) 0)
-                    (if spath-r (parquet-mtime spath-r) 0)]
-        last-mtimes (get @graph-scope-mtimes cache-key)]
-    (when (not= cur-mtimes last-mtimes)
-      (exec! conn "DROP TABLE IF EXISTS graph_entities")
-      (exec! conn graph-entities-ddl)
-      (exec! conn "DROP TABLE IF EXISTS graph_relations")
-      (exec! conn graph-relations-ddl)
-      (when session-id
-        (when (and spath-e (.exists (io/file spath-e)))
-          (exec! conn (str "INSERT INTO graph_entities
-                            SELECT id, canonical_name, kind, aliases, attrs, vector,
-                                   confidence, source_count, source_sessions,
-                                   created_at, updated_at, retired, 0 AS scope_rank
-                            FROM read_parquet('" spath-e "')")))
-        (when (and spath-r (.exists (io/file spath-r)))
-          (exec! conn (str "INSERT INTO graph_relations
-                            SELECT id, subject_id, predicate, object_id,
-                                   confidence, source_id, source_table, source_sessions,
-                                   created_at, updated_at, retired, 0 AS scope_rank
-                            FROM read_parquet('" spath-r "')"))))
-      (when (.exists (io/file gpath-e))
-        (exec! conn (str "INSERT INTO graph_entities
-                          SELECT id, canonical_name, kind, aliases, attrs, vector,
-                                 confidence, source_count, source_sessions,
-                                 created_at, updated_at, retired, 1 AS scope_rank
-                          FROM read_parquet('" gpath-e "')")))
-      (when (.exists (io/file gpath-r))
-        (exec! conn (str "INSERT INTO graph_relations
-                          SELECT id, subject_id, predicate, object_id,
-                                 confidence, source_id, source_table, source_sessions,
-                                 created_at, updated_at, retired, 1 AS scope_rank
-                          FROM read_parquet('" gpath-r "')")))
-      (swap! graph-scope-mtimes assoc cache-key cur-mtimes))))
+  "Load each scope in priority order. Element index = scope_rank.
+   GLOBAL_SID resolves to global parquets; any other sid to session parquets.
+   Caller must pass an already-normalised vector (use loom.scope/normalize-stack).
+
+   Concurrency: the in-memory `graph_entities` / `graph_relations` tables are
+   a singleton per connection. We `locking` on the conn so two callers with
+   different stacks cannot interleave DROP+INSERT and observe a torn state.
+   If Loom moves to a connection pool, this lock target must change to the
+   `graph-scope-mtimes` atom — flagged in plan §11."
+  [conn ctx session-ids]
+  (let [paths (mapv (fn [sid]
+                      (if (= sid GLOBAL_SID)
+                        {:e (entities-path ctx) :r (relations-path ctx)}
+                        {:e (session-entities-path ctx sid)
+                         :r (session-relations-path ctx sid)}))
+                    session-ids)
+        ;; cache key includes full ordered stack + each parquet's mtime
+        cache-key (mapv (fn [sid p]
+                          [sid (parquet-mtime (:e p)) (parquet-mtime (:r p))])
+                        session-ids paths)]
+    (locking conn
+      (let [last-key (get @graph-scope-mtimes ::stack)]
+        (when (not= cache-key last-key)
+          (exec! conn "DROP TABLE IF EXISTS graph_entities")
+          (exec! conn graph-entities-ddl)
+          (exec! conn "DROP TABLE IF EXISTS graph_relations")
+          (exec! conn graph-relations-ddl)
+          (doseq [[rank {:keys [e r]}] (map vector (range) paths)]
+            (when (and e (.exists (io/file e)))
+              (exec! conn (str "INSERT INTO graph_entities
+                                SELECT id, canonical_name, kind, aliases, attrs, vector,
+                                       confidence, source_count, source_sessions,
+                                       created_at, updated_at, retired,
+                                       " rank " AS scope_rank
+                                FROM read_parquet('" e "')")))
+            (when (and r (.exists (io/file r)))
+              (exec! conn (str "INSERT INTO graph_relations
+                                SELECT id, subject_id, predicate, object_id,
+                                       confidence, source_id, source_table, source_sessions,
+                                       created_at, updated_at, retired,
+                                       " rank " AS scope_rank
+                                FROM read_parquet('" r "')"))))
+          (swap! graph-scope-mtimes assoc ::stack cache-key))))))
 
 (defn db-upsert-entity!
   "Upsert an entity row to global or session graph tables.
@@ -1352,38 +1359,38 @@
             rid))))))
 
 (defn db-get-entity
-  "Get an entity by id with session-first semantics.
-   If session-id is provided: session entities first, then global fallback."
-  [ctx entity-id session-id]
+  "Get an entity by id with stack-priority semantics.
+   `session-ids` is an already-normalised vector (see loom.scope/normalize-stack).
+   Lower scope_rank wins; first hit returned."
+  [ctx entity-id session-ids]
   (with-provenance "loom.db/db-get-entity" 1
-    (let [conn (:conn ctx)
-          session-path (when session-id (session-entities-path ctx session-id))
-          session-hit (when (and session-path (.exists (io/file session-path)))
-                        (do
-                          (load-entities-table! conn session-path)
-                          (first (query conn
-                                   "SELECT * FROM entities WHERE id = ? AND retired = false"
-                                   entity-id))))]
-      (if session-hit
-        (entity-row->domain session-hit)
-        (let [global-path (entities-path ctx)]
-          (when (.exists (io/file global-path))
-            (load-entities-table! conn global-path)
-            (some-> (first (query conn
-                            "SELECT * FROM entities WHERE id = ? AND retired = false"
-                            entity-id))
-                    entity-row->domain)))))))
+    (let [conn (:conn ctx)]
+      (load-graph-scope! conn ctx session-ids)
+      (some-> (first (query conn
+                       "WITH ranked AS (
+                          SELECT *, row_number() OVER
+                                 (PARTITION BY id ORDER BY scope_rank ASC, updated_at DESC) AS rn
+                          FROM graph_entities
+                          WHERE retired = false AND id = ?
+                        )
+                        SELECT id, canonical_name, kind, aliases, attrs, vector,
+                               confidence, source_count, source_sessions,
+                               created_at, updated_at, retired
+                        FROM ranked WHERE rn = 1"
+                       entity-id))
+              entity-row->domain))))
 
 (defn db-get-entities-by-ids
-  "Batch-fetch entities by ids with session-first semantics.
-   Returns a vector of entity maps; session rows shadow global rows by same id.
+  "Batch-fetch entities by ids with stack-priority semantics.
+   `session-ids` is an already-normalised vector (see loom.scope/normalize-stack).
+   Returns a vector of entity maps; lower-rank rows shadow higher-rank rows by same id.
    A single SQL round-trip regardless of how many ids are provided."
-  [ctx ids session-id]
+  [ctx ids session-ids]
   (with-provenance "loom.db/db-get-entities-by-ids" 1
     (if (empty? ids)
       []
       (let [conn (:conn ctx)]
-        (load-graph-scope! conn ctx session-id)
+        (load-graph-scope! conn ctx session-ids)
         (let [placeholders (str/join "," (repeat (count ids) "?"))
               sql (str "WITH ranked AS (
                           SELECT *, row_number() OVER (PARTITION BY id ORDER BY scope_rank ASC, updated_at DESC) AS rn
@@ -1398,41 +1405,36 @@
                (mapv entity-row->domain)))))))
 
 (defn db-get-relation
-  "Get a relation by id across session-first (optional) then global."
-  [ctx relation-id session-id]
+  "Get a relation by id with stack-priority semantics.
+   `session-ids` is an already-normalised vector (see loom.scope/normalize-stack)."
+  [ctx relation-id session-ids]
   (with-provenance "loom.db/db-get-relation" 1
-    (let [conn (:conn ctx)
-          session-path (when session-id (session-relations-path ctx session-id))
-          session-hit (when (and session-path (.exists (io/file session-path)))
-                        (do
-                          (load-relations-table! conn session-path)
-                          (first (query conn
-                                   "SELECT * FROM relations WHERE id = ? AND retired = false"
-                                   relation-id))))]
-      (if session-hit
-        (relation-row->domain session-hit)
-        (let [global-path (relations-path ctx)]
-          (when (.exists (io/file global-path))
-            (load-relations-table! conn global-path)
-            (some-> (first (query conn
-                            "SELECT * FROM relations WHERE id = ? AND retired = false"
-                            relation-id))
-                    relation-row->domain)))))))
+    (let [conn (:conn ctx)]
+      (load-graph-scope! conn ctx session-ids)
+      (some-> (first (query conn
+                       "WITH ranked AS (
+                          SELECT *, row_number() OVER
+                                 (PARTITION BY id ORDER BY scope_rank ASC, updated_at DESC) AS rn
+                          FROM graph_relations
+                          WHERE retired = false AND id = ?
+                        )
+                        SELECT id, subject_id, predicate, object_id,
+                               confidence, source_id, source_table, source_sessions,
+                               created_at, updated_at, retired
+                        FROM ranked WHERE rn = 1"
+                       relation-id))
+              relation-row->domain))))
 
 (defn db-list-entities
-  "List entities across scope (:session|:global|:both).
-   opts: {:scope :global|:session|:both :session-id sid :kind \"tool\" :limit 100}."
-  [ctx {:keys [scope session-id kind limit] :or {scope :both limit 100}}]
+  "List entities loaded from the given stack.
+   `:session-ids` is an already-normalised vector. Lower scope_rank wins on dedup.
+   opts: {:session-ids [sid…] :kind \"tool\" :limit 100}."
+  [ctx {:keys [session-ids kind limit] :or {limit 100}}]
   (with-provenance "loom.db/db-list-entities" 1
-    (let [conn (:conn ctx)
-          sid  (when (#{:session :both} scope) (or session-id (:session-id ctx)))]
-      (load-graph-scope! conn ctx sid)
+    (let [conn (:conn ctx)]
+      (load-graph-scope! conn ctx session-ids)
       (let [rows (query conn "SELECT * FROM graph_entities")
-            scope-filtered (case scope
-                             :session (filter #(= 0 (:scope_rank %)) rows)
-                             :global  (filter #(= 1 (:scope_rank %)) rows)
-                             rows)
-            deduped (->> scope-filtered
+            deduped (->> rows
                          (sort-by (juxt :scope_rank :updated_at))
                          (reduce (fn [acc r]
                                    (if (contains? acc (:id r)) acc (assoc acc (:id r) r))) {})
@@ -1444,13 +1446,13 @@
         (mapv entity-row->domain filtered)))))
 
 (defn db-search-entities
-  "Semantic search over entities with session-first + global fallback dedupe.
-   opts: {:session-id sid :kind \"concept\"}."
-  [ctx query-vec k {:keys [session-id kind]}]
+  "Semantic search over entities with stack-priority dedupe.
+   opts: {:session-ids [sid…] :kind \"concept\"}."
+  [ctx query-vec k {:keys [session-ids kind]}]
   (with-provenance "loom.db/db-search-entities" 1
     (let [conn  (:conn ctx)
           vec-s (float-vec->sql query-vec)]
-      (load-graph-scope! conn ctx session-id)
+      (load-graph-scope! conn ctx session-ids)
       (let [kind-clause (if kind " AND kind = ?" "")
             params      (if kind [(name kind)] [])
             sql         (str
@@ -1474,12 +1476,12 @@
 
 (defn db-search-entities-by-name
   "Prefix search over entities by canonical_name (case-insensitive).
-   Session rows shadow global rows by same id.
-   opts: {:session-id sid :limit n :kind k}."
-  [ctx name-prefix {:keys [session-id limit kind] :or {limit 20}}]
+   Lower-rank rows shadow higher-rank rows by same id.
+   opts: {:session-ids [sid…] :limit n :kind k}."
+  [ctx name-prefix {:keys [session-ids limit kind] :or {limit 20}}]
   (with-provenance "loom.db/db-search-entities-by-name" 1
     (let [conn (:conn ctx)]
-      (load-graph-scope! conn ctx session-id)
+      (load-graph-scope! conn ctx session-ids)
       (let [kind-clause (if kind " AND kind = ?" "")
             kind-params (if kind [(name kind)] [])
             sql (str "WITH ranked AS (
@@ -1503,19 +1505,15 @@
              (mapv entity-row->domain))))))
 
 (defn db-list-relations
-  "List relations across scope (:session|:global|:both).
-   opts: {:scope :global|:session|:both :session-id sid :limit 200}."
-  [ctx {:keys [scope session-id limit] :or {scope :both limit 200}}]
+  "List relations loaded from the given stack.
+   `:session-ids` is an already-normalised vector. Lower scope_rank wins on dedup.
+   opts: {:session-ids [sid…] :limit 200}."
+  [ctx {:keys [session-ids limit] :or {limit 200}}]
   (with-provenance "loom.db/db-list-relations" 1
-    (let [conn (:conn ctx)
-          sid  (when (#{:session :both} scope) (or session-id (:session-id ctx)))]
-      (load-graph-scope! conn ctx sid)
+    (let [conn (:conn ctx)]
+      (load-graph-scope! conn ctx session-ids)
       (let [rows (query conn "SELECT * FROM graph_relations")
-            scope-filtered (case scope
-                             :session (filter #(= 0 (:scope_rank %)) rows)
-                             :global  (filter #(= 1 (:scope_rank %)) rows)
-                             rows)
-            deduped (->> scope-filtered
+            deduped (->> rows
                          (sort-by (juxt :scope_rank :updated_at))
                          (reduce (fn [acc r]
                                    (if (contains? acc (:id r)) acc (assoc acc (:id r) r))) {})
@@ -1527,13 +1525,13 @@
 
 (defn db-search-relations
   "Search relations by optional filters.
-   opts: {:session-id sid :subject-id s :object-id o :predicate p :limit n}."
-  [ctx {:keys [session-id subject-id object-id predicate limit]
+   opts: {:session-ids [sid…] :subject-id s :object-id o :predicate p :limit n}."
+  [ctx {:keys [session-ids subject-id object-id predicate limit]
         :or {limit 200}}]
   (with-provenance "loom.db/db-search-relations" 1
     (let [conn (:conn ctx)
           pred (when predicate (normalize-predicate predicate))]
-      (load-graph-scope! conn ctx session-id)
+      (load-graph-scope! conn ctx session-ids)
       (let [conditions ["retired = false"]
             params     (atom [])
             conditions (if subject-id
@@ -1622,14 +1620,14 @@
 
 (defn db-neighbors
   "Return one-hop neighbors from graph relations.
-   opts: {:session-id sid :direction :out|:in|:both :predicates [..] :limit n}."
-  [ctx entity-id {:keys [session-id direction predicates limit]
+   opts: {:session-ids [sid…] :direction :out|:in|:both :predicates [..] :limit n}."
+  [ctx entity-id {:keys [session-ids direction predicates limit]
                   :or {direction :out limit 100}}]
   (with-provenance "loom.db/db-neighbors" 1
     (let [conn (:conn ctx)
           pred-set (when (seq predicates)
                      (set (map normalize-predicate predicates)))]
-      (load-graph-scope! conn ctx session-id)
+      (load-graph-scope! conn ctx session-ids)
       (let [dir-clause (case direction
                          :out  "subject_id = ?"
                          :in   "object_id = ?"
@@ -1662,11 +1660,11 @@
 
 (defn db-neighbor-counts
   "Return in/out degree counts for an entity using COUNT(*) queries.
-   opts: {:session-id sid}."
-  [ctx entity-id {:keys [session-id]}]
+   opts: {:session-ids [sid…]}."
+  [ctx entity-id {:keys [session-ids]}]
   (with-provenance "loom.db/db-neighbor-counts" 1
     (let [conn (:conn ctx)]
-      (load-graph-scope! conn ctx session-id)
+      (load-graph-scope! conn ctx session-ids)
       (let [out-count (:count (first (query conn
                                       "SELECT COUNT(*) AS count FROM graph_relations
                                        WHERE retired = false AND subject_id = ?"
@@ -1679,12 +1677,12 @@
 
 (defn db-bfs
   "Breadth-first traversal over in-memory graph_relations with cycle checks.
-   opts: {:session-id sid :max-depth 3 :limit 200 :undirected? false}."
-  [ctx start-id {:keys [session-id max-depth limit undirected?]
+   opts: {:session-ids [sid…] :max-depth 3 :limit 200 :undirected? false}."
+  [ctx start-id {:keys [session-ids max-depth limit undirected?]
                  :or {max-depth 3 limit 200 undirected? false}}]
   (with-provenance "loom.db/db-bfs" 1
     (let [conn (:conn ctx)]
-      (load-graph-scope! conn ctx session-id)
+      (load-graph-scope! conn ctx session-ids)
       (let [sql (if undirected?
                   "WITH RECURSIVE rel_edges AS (
                      SELECT subject_id, object_id, retired FROM graph_relations
@@ -1738,21 +1736,21 @@
   "Return {:nodes [entity...] :edges [relation...]} for a BFS subgraph.
    Internally: BFS → batch entity hydration → filtered relation fetch.
    SQL query count ≤ 3 regardless of graph size.
-   opts: {:session-id sid :max-depth n :direction :out/:in/:both}."
-  [ctx start-id {:keys [session-id max-depth direction]
+   opts: {:session-ids [sid…] :max-depth n :direction :out/:in/:both}."
+  [ctx start-id {:keys [session-ids max-depth direction]
                  :or {max-depth 3 direction :out}}]
   (with-provenance "loom.db/db-subgraph" 1
     (let [conn (:conn ctx)
           undirected? (= direction :both)]
       ;; Query 1: BFS to collect node IDs
-      (load-graph-scope! conn ctx session-id)
-      (let [bfs-rows (unwrap! (db-bfs ctx start-id {:session-id session-id
+      (load-graph-scope! conn ctx session-ids)
+      (let [bfs-rows (unwrap! (db-bfs ctx start-id {:session-ids session-ids
                                                      :max-depth max-depth
                                                      :limit 200
                                                      :undirected? undirected?}))
             node-ids (vec (distinct (conj (mapv :node_id bfs-rows) start-id)))]
         ;; Query 2: batch hydrate entities
-        (let [nodes (unwrap! (db-get-entities-by-ids ctx node-ids session-id))
+        (let [nodes (unwrap! (db-get-entities-by-ids ctx node-ids session-ids))
               id-set (set node-ids)
               ;; Query 3: fetch all relations connecting these nodes
               placeholders (str/join "," (repeat (count node-ids) "?"))
