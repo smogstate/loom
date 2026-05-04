@@ -27,6 +27,7 @@
 
 (defonce ^:private write-ch (async/chan 256))
 (defonce ^:private writer-started? (atom false))
+(defonce ^:private graph-scope-mtimes (atom {}))
 
 (defn start-writer!
   "Start the serialized write loop. Idempotent."
@@ -1157,42 +1158,55 @@
   (-> row
       (update :source_sessions parse-json-array)))
 
+(defn- parquet-mtime [path]
+  (let [f (io/file path)]
+    (if (.exists f) (.lastModified f) 0)))
+
 (defn- load-graph-scope!
-  "Load session-first then global graph data into in-memory union tables."
+  "Load session-first then global graph data into in-memory union tables.
+   Uses mtime-based cache: no-op when parquet files haven't changed since last load."
   [conn ctx session-id]
-  (exec! conn "DROP TABLE IF EXISTS graph_entities")
-  (exec! conn graph-entities-ddl)
-  (exec! conn "DROP TABLE IF EXISTS graph_relations")
-  (exec! conn graph-relations-ddl)
-  (when session-id
-    (let [spath-e (session-entities-path ctx session-id)
-          spath-r (session-relations-path ctx session-id)]
-      (when (.exists (io/file spath-e))
+  (let [spath-e (when session-id (session-entities-path ctx session-id))
+        spath-r (when session-id (session-relations-path ctx session-id))
+        gpath-e (entities-path ctx)
+        gpath-r (relations-path ctx)
+        cache-key [session-id gpath-e gpath-r]
+        cur-mtimes [(parquet-mtime gpath-e)
+                    (parquet-mtime gpath-r)
+                    (if spath-e (parquet-mtime spath-e) 0)
+                    (if spath-r (parquet-mtime spath-r) 0)]
+        last-mtimes (get @graph-scope-mtimes cache-key)]
+    (when (not= cur-mtimes last-mtimes)
+      (exec! conn "DROP TABLE IF EXISTS graph_entities")
+      (exec! conn graph-entities-ddl)
+      (exec! conn "DROP TABLE IF EXISTS graph_relations")
+      (exec! conn graph-relations-ddl)
+      (when session-id
+        (when (and spath-e (.exists (io/file spath-e)))
+          (exec! conn (str "INSERT INTO graph_entities
+                            SELECT id, canonical_name, kind, aliases, attrs, vector,
+                                   confidence, source_count, source_sessions,
+                                   created_at, updated_at, retired, 0 AS scope_rank
+                            FROM read_parquet('" spath-e "')")))
+        (when (and spath-r (.exists (io/file spath-r)))
+          (exec! conn (str "INSERT INTO graph_relations
+                            SELECT id, subject_id, predicate, object_id,
+                                   confidence, source_id, source_table, source_sessions,
+                                   created_at, updated_at, retired, 0 AS scope_rank
+                            FROM read_parquet('" spath-r "')"))))
+      (when (.exists (io/file gpath-e))
         (exec! conn (str "INSERT INTO graph_entities
                           SELECT id, canonical_name, kind, aliases, attrs, vector,
                                  confidence, source_count, source_sessions,
-                                 created_at, updated_at, retired, 0 AS scope_rank
-                          FROM read_parquet('" spath-e "')")))
-      (when (.exists (io/file spath-r))
+                                 created_at, updated_at, retired, 1 AS scope_rank
+                          FROM read_parquet('" gpath-e "')")))
+      (when (.exists (io/file gpath-r))
         (exec! conn (str "INSERT INTO graph_relations
                           SELECT id, subject_id, predicate, object_id,
                                  confidence, source_id, source_table, source_sessions,
-                                 created_at, updated_at, retired, 0 AS scope_rank
-                          FROM read_parquet('" spath-r "')")))))
-  (let [gpath-e (entities-path ctx)
-        gpath-r (relations-path ctx)]
-    (when (.exists (io/file gpath-e))
-      (exec! conn (str "INSERT INTO graph_entities
-                        SELECT id, canonical_name, kind, aliases, attrs, vector,
-                               confidence, source_count, source_sessions,
-                               created_at, updated_at, retired, 1 AS scope_rank
-                        FROM read_parquet('" gpath-e "')")))
-    (when (.exists (io/file gpath-r))
-      (exec! conn (str "INSERT INTO graph_relations
-                        SELECT id, subject_id, predicate, object_id,
-                               confidence, source_id, source_table, source_sessions,
-                               created_at, updated_at, retired, 1 AS scope_rank
-                        FROM read_parquet('" gpath-r "')")))))
+                                 created_at, updated_at, retired, 1 AS scope_rank
+                          FROM read_parquet('" gpath-r "')")))
+      (swap! graph-scope-mtimes assoc cache-key cur-mtimes))))
 
 (defn db-upsert-entity!
   "Upsert an entity row to global or session graph tables.
@@ -1247,6 +1261,7 @@
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
               id cname kind aliases attrs vec-s confidence source-count source-sids retired))
           (flush-entities! conn path)
+          (reset! graph-scope-mtimes {})
           id)))))
 
 (defn db-retire-entity!
@@ -1263,6 +1278,7 @@
           (load-entities-table! conn path)
           (exec! conn "UPDATE entities SET retired = true, updated_at = now() WHERE id = ?" entity-id)
           (flush-entities! conn path)
+          (reset! graph-scope-mtimes {})
           entity-id)))))
 
 (defn db-upsert-relation!
@@ -1332,6 +1348,7 @@
                 source-sids
                 retired))
             (flush-relations! conn path)
+            (reset! graph-scope-mtimes {})
             rid))))))
 
 (defn db-get-entity
@@ -1356,6 +1373,29 @@
                             "SELECT * FROM entities WHERE id = ? AND retired = false"
                             entity-id))
                     entity-row->domain)))))))
+
+(defn db-get-entities-by-ids
+  "Batch-fetch entities by ids with session-first semantics.
+   Returns a vector of entity maps; session rows shadow global rows by same id.
+   A single SQL round-trip regardless of how many ids are provided."
+  [ctx ids session-id]
+  (with-provenance "loom.db/db-get-entities-by-ids" 1
+    (if (empty? ids)
+      []
+      (let [conn (:conn ctx)]
+        (load-graph-scope! conn ctx session-id)
+        (let [placeholders (str/join "," (repeat (count ids) "?"))
+              sql (str "WITH ranked AS (
+                          SELECT *, row_number() OVER (PARTITION BY id ORDER BY scope_rank ASC, updated_at DESC) AS rn
+                          FROM graph_entities
+                          WHERE retired = false AND id IN (" placeholders ")
+                        )
+                        SELECT id, canonical_name, kind, aliases, attrs, vector,
+                               confidence, source_count, source_sessions,
+                               created_at, updated_at, retired
+                        FROM ranked WHERE rn = 1")]
+          (->> (apply query conn sql (vec ids))
+               (mapv entity-row->domain)))))))
 
 (defn db-get-relation
   "Get a relation by id across session-first (optional) then global."
@@ -1432,6 +1472,36 @@
         (->> (apply query conn sql params)
              (mapv entity-row->domain))))))
 
+(defn db-search-entities-by-name
+  "Prefix search over entities by canonical_name (case-insensitive).
+   Session rows shadow global rows by same id.
+   opts: {:session-id sid :limit n :kind k}."
+  [ctx name-prefix {:keys [session-id limit kind] :or {limit 20}}]
+  (with-provenance "loom.db/db-search-entities-by-name" 1
+    (let [conn (:conn ctx)]
+      (load-graph-scope! conn ctx session-id)
+      (let [kind-clause (if kind " AND kind = ?" "")
+            kind-params (if kind [(name kind)] [])
+            sql (str "WITH ranked AS (
+                        SELECT id, canonical_name, kind, aliases, attrs, vector,
+                               confidence, source_count, source_sessions,
+                               created_at, updated_at, retired, scope_rank,
+                               row_number() OVER (PARTITION BY id ORDER BY scope_rank ASC, updated_at DESC) AS rn
+                        FROM graph_entities
+                        WHERE retired = false
+                          AND lower(canonical_name) LIKE lower(?) || '%'"
+                     kind-clause "
+                      )
+                      SELECT id, canonical_name, kind, aliases, attrs, vector,
+                             confidence, source_count, source_sessions,
+                             created_at, updated_at, retired
+                      FROM ranked
+                      WHERE rn = 1
+                      ORDER BY canonical_name ASC
+                      LIMIT " (int limit))]
+        (->> (apply query conn sql name-prefix kind-params)
+             (mapv entity-row->domain))))))
+
 (defn db-list-relations
   "List relations across scope (:session|:global|:both).
    opts: {:scope :global|:session|:both :session-id sid :limit 200}."
@@ -1464,21 +1534,33 @@
     (let [conn (:conn ctx)
           pred (when predicate (normalize-predicate predicate))]
       (load-graph-scope! conn ctx session-id)
-      (->> (query conn
-             "SELECT id, subject_id, predicate, object_id,
-                     confidence, source_id, source_table, source_sessions,
-                     created_at, updated_at, retired, scope_rank
-              FROM graph_relations
-              WHERE retired = false")
-           (sort-by (juxt :scope_rank :updated_at))
-           (filter #(or (nil? subject-id) (= subject-id (:subject_id %))))
-           (filter #(or (nil? object-id) (= object-id (:object_id %))))
-           (filter #(or (nil? pred) (= pred (:predicate %))))
-           (reduce (fn [acc r]
-                     (if (contains? acc (:id r)) acc (assoc acc (:id r) r))) {})
-           vals
-           (take (int limit))
-           (mapv relation-row->domain)))))
+      (let [conditions ["retired = false"]
+            params     (atom [])
+            conditions (if subject-id
+                         (do (swap! params conj subject-id)
+                             (conj conditions "subject_id = ?"))
+                         conditions)
+            conditions (if object-id
+                         (do (swap! params conj object-id)
+                             (conj conditions "object_id = ?"))
+                         conditions)
+            conditions (if pred
+                         (do (swap! params conj pred)
+                             (conj conditions "predicate = ?"))
+                         conditions)
+            where-clause (str/join " AND " conditions)
+            sql (str "SELECT id, subject_id, predicate, object_id,
+                             confidence, source_id, source_table, source_sessions,
+                             created_at, updated_at, retired, scope_rank
+                      FROM graph_relations
+                      WHERE " where-clause "
+                      ORDER BY scope_rank ASC, updated_at DESC")]
+        (->> (apply query conn sql @params)
+             (reduce (fn [acc r]
+                       (if (contains? acc (:id r)) acc (assoc acc (:id r) r))) {})
+             vals
+             (take (int limit))
+             (mapv relation-row->domain))))))
 
 (defn db-merge-entities!
   "Merge from-id into to-id atomically inside one write! thunk.
@@ -1535,6 +1617,7 @@
                 (exec! conn "UPDATE relations SET object_id  = ?, updated_at = now() WHERE object_id  = ?" to-id from-id)
                 (flush-entities! conn entity-path)
                 (flush-relations! conn relation-path)
+                (reset! graph-scope-mtimes {})
                 {:merged true :from-id from-id :to-id to-id :scope scope}))))))))
 
 (defn db-neighbors
@@ -1547,28 +1630,52 @@
           pred-set (when (seq predicates)
                      (set (map normalize-predicate predicates)))]
       (load-graph-scope! conn ctx session-id)
-      (->> (query conn
-             "SELECT id, subject_id, predicate, object_id,
-                     confidence, source_id, source_table, source_sessions,
-                     created_at, updated_at, retired, scope_rank
-              FROM graph_relations
-              WHERE retired = false")
-           (sort-by (juxt :scope_rank :updated_at))
-           (filter (fn [r]
-                     (case direction
-                       :out  (= entity-id (:subject_id r))
-                       :in   (= entity-id (:object_id r))
-                       :both (or (= entity-id (:subject_id r))
-                                 (= entity-id (:object_id r)))
-                       (= entity-id (:subject_id r)))))
-           (filter #(or (nil? pred-set) (pred-set (:predicate %))))
-           (map (fn [r]
-                  (assoc (relation-row->domain r)
-                         :neighbor_id (if (= entity-id (:subject_id r))
-                                        (:object_id r)
-                                        (:subject_id r)))))
-           (take (int limit))
-           vec))))
+      (let [dir-clause (case direction
+                         :out  "subject_id = ?"
+                         :in   "object_id = ?"
+                         :both "(subject_id = ? OR object_id = ?)"
+                         "subject_id = ?")
+            base-params (if (= direction :both)
+                          [entity-id entity-id]
+                          [entity-id])
+            pred-clause (when pred-set
+                          (str " AND predicate IN ("
+                               (str/join "," (repeat (count pred-set) "?"))
+                               ")"))
+            pred-params (if pred-set (vec pred-set) [])
+            sql (str "SELECT id, subject_id, predicate, object_id,
+                             confidence, source_id, source_table, source_sessions,
+                             created_at, updated_at, retired, scope_rank
+                      FROM graph_relations
+                      WHERE retired = false AND " dir-clause
+                     (or pred-clause "")
+                     " ORDER BY scope_rank ASC, updated_at DESC")]
+        (->> (apply query conn sql (concat base-params pred-params))
+             (sort-by (juxt :scope_rank :updated_at))
+             (map (fn [r]
+                    (assoc (relation-row->domain r)
+                           :neighbor_id (if (= entity-id (:subject_id r))
+                                          (:object_id r)
+                                          (:subject_id r)))))
+             (take (int limit))
+             vec)))))
+
+(defn db-neighbor-counts
+  "Return in/out degree counts for an entity using COUNT(*) queries.
+   opts: {:session-id sid}."
+  [ctx entity-id {:keys [session-id]}]
+  (with-provenance "loom.db/db-neighbor-counts" 1
+    (let [conn (:conn ctx)]
+      (load-graph-scope! conn ctx session-id)
+      (let [out-count (:count (first (query conn
+                                      "SELECT COUNT(*) AS count FROM graph_relations
+                                       WHERE retired = false AND subject_id = ?"
+                                      entity-id)))
+            in-count  (:count (first (query conn
+                                      "SELECT COUNT(*) AS count FROM graph_relations
+                                       WHERE retired = false AND object_id = ?"
+                                      entity-id)))]
+        {:in (int (or in-count 0)) :out (int (or out-count 0))}))))
 
 (defn db-bfs
   "Breadth-first traversal over in-memory graph_relations with cycle checks.
@@ -1626,6 +1733,46 @@
                    ORDER BY min_depth ASC, node_id ASC
                    LIMIT ?")]
         (query conn sql start-id start-id (int max-depth) (int limit))))))
+
+(defn db-subgraph
+  "Return {:nodes [entity...] :edges [relation...]} for a BFS subgraph.
+   Internally: BFS → batch entity hydration → filtered relation fetch.
+   SQL query count ≤ 3 regardless of graph size.
+   opts: {:session-id sid :max-depth n :direction :out/:in/:both}."
+  [ctx start-id {:keys [session-id max-depth direction]
+                 :or {max-depth 3 direction :out}}]
+  (with-provenance "loom.db/db-subgraph" 1
+    (let [conn (:conn ctx)
+          undirected? (= direction :both)]
+      ;; Query 1: BFS to collect node IDs
+      (load-graph-scope! conn ctx session-id)
+      (let [bfs-rows (unwrap! (db-bfs ctx start-id {:session-id session-id
+                                                     :max-depth max-depth
+                                                     :limit 200
+                                                     :undirected? undirected?}))
+            node-ids (vec (distinct (conj (mapv :node_id bfs-rows) start-id)))]
+        ;; Query 2: batch hydrate entities
+        (let [nodes (unwrap! (db-get-entities-by-ids ctx node-ids session-id))
+              id-set (set node-ids)
+              ;; Query 3: fetch all relations connecting these nodes
+              placeholders (str/join "," (repeat (count node-ids) "?"))
+              edge-sql (str "WITH ranked AS (
+                               SELECT id, subject_id, predicate, object_id,
+                                      confidence, source_id, source_table, source_sessions,
+                                      created_at, updated_at, retired, scope_rank,
+                                      row_number() OVER (PARTITION BY id ORDER BY scope_rank ASC, updated_at DESC) AS rn
+                               FROM graph_relations
+                               WHERE retired = false
+                                 AND subject_id IN (" placeholders ")
+                                 AND object_id IN (" placeholders ")
+                             )
+                             SELECT id, subject_id, predicate, object_id,
+                                    confidence, source_id, source_table, source_sessions,
+                                    created_at, updated_at, retired
+                             FROM ranked WHERE rn = 1")
+              edges (->> (apply query conn edge-sql (concat node-ids node-ids))
+                         (mapv relation-row->domain))]
+          {:nodes nodes :edges edges})))))
 
 (defn migrate-facts-to-graph!
   "One-time migration from facts/session_facts parquet into graph tables.

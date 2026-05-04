@@ -55,6 +55,15 @@
     (let [vec (unwrap! (embedder/embed ctx query))]
       (unwrap! (db/db-search-entities ctx vec k {:session-id session-id :kind kind})))))
 
+(defn search-entities-by-name
+  "Prefix search over entities by canonical_name (case-insensitive). No embedding required."
+  [ctx name-prefix & {:keys [session-id limit kind]}]
+  (with-provenance "loom.graph/search-entities-by-name" 1
+    (unwrap! (db/db-search-entities-by-name ctx name-prefix
+                                             {:session-id session-id
+                                              :limit (or limit 20)
+                                              :kind kind}))))
+
 (defn search-relations
   "Search relations with optional filters."
   [ctx & {:keys [session-id subject-id object-id predicate limit]}]
@@ -81,7 +90,21 @@
     (unwrap! (db/db-bfs ctx start-id {:session-id session-id
                                       :max-depth (or max-depth 3)
                                       :limit (or limit 200)
-                                      :undirected? (boolean undirected?)}))))
+                                       :undirected? (boolean undirected?)}))))
+
+(defn subgraph
+  "Return {:nodes [entity...] :edges [relation...]} for a BFS subgraph from start-id.
+   Single call; SQL query count ≤ 3 regardless of graph size.
+   opts: {:session-id s :max-depth n :direction :out/:in/:both}."
+  [ctx start-id opts]
+  (with-provenance "loom.graph/subgraph" 1
+    (unwrap! (db/db-subgraph ctx start-id opts))))
+
+(defn neighbor-counts
+  "Return {:in n :out n} degree counts for an entity. Uses COUNT(*) SQL — no entity hydration."
+  [ctx entity-id & {:keys [session-id]}]
+  (with-provenance "loom.graph/neighbor-counts" 1
+    (unwrap! (db/db-neighbor-counts ctx entity-id {:session-id session-id}))))
 
 (defn resolve-entity!
   "Resolve a candidate entity against existing entities in scope.

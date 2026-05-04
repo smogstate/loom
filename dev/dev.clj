@@ -2,6 +2,7 @@
   "REPL convenience namespace. Starts loom and binds ctx."
   (:require [loom.core :as loom]
             [loom.db :as db]
+            [loom.graph :as graph]
             [loom.embedder :as embedder]
             [loom.tools :as tools]
             [loom.session :as session]
