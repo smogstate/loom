@@ -7,7 +7,7 @@
             [clojure.java.io :as io]
             [cheshire.core :as json]
             [clojure.core.async :as async]
-            [loom.envelope :refer [with-provenance]])
+            [loom.envelope :refer [with-provenance unwrap!]])
   (:import [org.duckdb DuckDBConnection]
            [java.sql DriverManager ResultSet]))
 
@@ -783,8 +783,22 @@
                (str "SELECT chunk_offset FROM read_parquet('" path "') WHERE blob_id = ?")
                blob-id)
              (map :chunk_offset)
-             set)
-        #{}))))
+              set)
+         #{}))))
+
+(defn list-chunks-by-blob
+  "Return all chunks for blob-id ordered by chunk_offset ASC."
+  [ctx blob-id]
+  (with-provenance "loom.db/list-chunks-by-blob" 1
+    (let [conn (:conn ctx)
+          path (parquet-path (get-in ctx [:config :loom-dir]) :chunks)]
+      (if (.exists (io/file path))
+        (query conn (str "SELECT id, blob_id, chunk_offset, vector, summary, content
+                          FROM read_parquet('" path "')
+                          WHERE blob_id = ?
+                          ORDER BY chunk_offset ASC")
+               blob-id)
+        []))))
 
 ;; ---------------------------------------------------------------------------
 ;; Blobs — global
@@ -986,3 +1000,713 @@
   [conn sql params]
   (apply query conn sql params))
 
+;; ---------------------------------------------------------------------------
+;; Knowledge graph — entities / relations (global + session)
+;; ---------------------------------------------------------------------------
+
+(def ^:private allowed-entity-kinds
+  #{"concept" "tool" "goal" "agent" "file" "external"})
+
+(def ^:private allowed-predicates
+  #{"IS_A" "PART_OF" "HAS_PART" "USES" "DEPENDS_ON" "IMPLEMENTS"
+    "DEFINED_IN" "MENTIONED_IN" "CAUSES" "BLOCKS" "RELATES_TO"
+    "CONTRADICTS" "SUPERSEDES" "AUTHORED_BY" "ABOUT"})
+
+(def ^:private entities-ddl
+  "CREATE TABLE IF NOT EXISTS entities (
+     id              VARCHAR PRIMARY KEY,
+     canonical_name  VARCHAR,
+     kind            VARCHAR,
+     aliases         VARCHAR,
+     attrs           VARCHAR,
+     vector          VARCHAR,
+     confidence      DOUBLE,
+     source_count    INTEGER DEFAULT 1,
+     source_sessions VARCHAR,
+     created_at      TIMESTAMP DEFAULT now(),
+     updated_at      TIMESTAMP DEFAULT now(),
+     retired         BOOLEAN DEFAULT false
+   )")
+
+(def ^:private relations-ddl
+  "CREATE TABLE IF NOT EXISTS relations (
+     id              VARCHAR PRIMARY KEY,
+     subject_id      VARCHAR,
+     predicate       VARCHAR,
+     object_id       VARCHAR,
+     confidence      DOUBLE,
+     source_id       VARCHAR,
+     source_table    VARCHAR,
+     source_sessions VARCHAR,
+     created_at      TIMESTAMP DEFAULT now(),
+     updated_at      TIMESTAMP DEFAULT now(),
+     retired         BOOLEAN DEFAULT false
+   )")
+
+(def ^:private graph-entities-ddl
+  "CREATE TABLE IF NOT EXISTS graph_entities (
+     id              VARCHAR,
+     canonical_name  VARCHAR,
+     kind            VARCHAR,
+     aliases         VARCHAR,
+     attrs           VARCHAR,
+     vector          VARCHAR,
+     confidence      DOUBLE,
+     source_count    INTEGER,
+     source_sessions VARCHAR,
+     created_at      TIMESTAMP,
+     updated_at      TIMESTAMP,
+     retired         BOOLEAN,
+     scope_rank      INTEGER
+   )")
+
+(def ^:private graph-relations-ddl
+  "CREATE TABLE IF NOT EXISTS graph_relations (
+     id              VARCHAR,
+     subject_id      VARCHAR,
+     predicate       VARCHAR,
+     object_id       VARCHAR,
+     confidence      DOUBLE,
+     source_id       VARCHAR,
+     source_table    VARCHAR,
+     source_sessions VARCHAR,
+     created_at      TIMESTAMP,
+     updated_at      TIMESTAMP,
+     retired         BOOLEAN,
+     scope_rank      INTEGER
+   )")
+
+(defn- entities-path [ctx]
+  (parquet-path (get-in ctx [:config :loom-dir]) :entities))
+
+(defn- relations-path [ctx]
+  (parquet-path (get-in ctx [:config :loom-dir]) :relations))
+
+(defn- session-entities-path [ctx session-id]
+  (session-parquet-path (get-in ctx [:config :loom-dir]) session-id :entities))
+
+(defn- session-relations-path [ctx session-id]
+  (session-parquet-path (get-in ctx [:config :loom-dir]) session-id :relations))
+
+(defn- load-entities-table! [conn path]
+  (exec! conn "DROP TABLE IF EXISTS entities")
+  (exec! conn entities-ddl)
+  (when (.exists (io/file path))
+    (exec! conn (str "INSERT INTO entities SELECT * FROM read_parquet('" path "')"))))
+
+(defn- flush-entities! [conn path]
+  (ensure-dir! (.getParent (io/file path)))
+  (exec! conn (str "COPY entities TO '" path "' (FORMAT PARQUET)")))
+
+(defn- load-relations-table! [conn path]
+  (exec! conn "DROP TABLE IF EXISTS relations")
+  (exec! conn relations-ddl)
+  (when (.exists (io/file path))
+    (exec! conn (str "INSERT INTO relations SELECT * FROM read_parquet('" path "')"))))
+
+(defn- flush-relations! [conn path]
+  (ensure-dir! (.getParent (io/file path)))
+  (exec! conn (str "COPY relations TO '" path "' (FORMAT PARQUET)")))
+
+(defn- parse-json-array [v]
+  (let [x (cond
+            (nil? v) []
+            (string? v) (or (parse-json v) [])
+            (sequential? v) (vec v)
+            :else [])]
+    (vec x)))
+
+(defn- parse-json-object [v]
+  (cond
+    (nil? v) {}
+    (map? v) v
+    (string? v) (or (parse-json v) {})
+    :else {}))
+
+(defn- encode-json-array [xs]
+  (json/encode (vec (distinct (remove nil? xs)))))
+
+(defn- normalize-kind [kind]
+  (when kind
+    (let [k (name kind)]
+      (when-not (contains? allowed-entity-kinds k)
+        (throw (ex-info "Invalid entity kind" {:kind k :allowed allowed-entity-kinds})))
+      k)))
+
+(defn- normalize-predicate [predicate]
+  (when predicate
+    (let [p (name predicate)]
+      (when-not (contains? allowed-predicates p)
+        (throw (ex-info "Invalid relation predicate" {:predicate p :allowed allowed-predicates})))
+      p)))
+
+(defn- normalize-vector-literal [v]
+  (cond
+    (nil? v) nil
+    (string? v) v
+    :else (float-vec->sql v)))
+
+(defn- entity-row->domain [row]
+  (-> row
+      (update :aliases parse-json-array)
+      (update :attrs parse-json-object)
+      (update :vector parse-float-vec)
+      (update :source_sessions parse-json-array)))
+
+(defn- relation-row->domain [row]
+  (-> row
+      (update :source_sessions parse-json-array)))
+
+(defn- load-graph-scope!
+  "Load session-first then global graph data into in-memory union tables."
+  [conn ctx session-id]
+  (exec! conn "DROP TABLE IF EXISTS graph_entities")
+  (exec! conn graph-entities-ddl)
+  (exec! conn "DROP TABLE IF EXISTS graph_relations")
+  (exec! conn graph-relations-ddl)
+  (when session-id
+    (let [spath-e (session-entities-path ctx session-id)
+          spath-r (session-relations-path ctx session-id)]
+      (when (.exists (io/file spath-e))
+        (exec! conn (str "INSERT INTO graph_entities
+                          SELECT id, canonical_name, kind, aliases, attrs, vector,
+                                 confidence, source_count, source_sessions,
+                                 created_at, updated_at, retired, 0 AS scope_rank
+                          FROM read_parquet('" spath-e "')")))
+      (when (.exists (io/file spath-r))
+        (exec! conn (str "INSERT INTO graph_relations
+                          SELECT id, subject_id, predicate, object_id,
+                                 confidence, source_id, source_table, source_sessions,
+                                 created_at, updated_at, retired, 0 AS scope_rank
+                          FROM read_parquet('" spath-r "')")))))
+  (let [gpath-e (entities-path ctx)
+        gpath-r (relations-path ctx)]
+    (when (.exists (io/file gpath-e))
+      (exec! conn (str "INSERT INTO graph_entities
+                        SELECT id, canonical_name, kind, aliases, attrs, vector,
+                               confidence, source_count, source_sessions,
+                               created_at, updated_at, retired, 1 AS scope_rank
+                        FROM read_parquet('" gpath-e "')")))
+    (when (.exists (io/file gpath-r))
+      (exec! conn (str "INSERT INTO graph_relations
+                        SELECT id, subject_id, predicate, object_id,
+                               confidence, source_id, source_table, source_sessions,
+                               created_at, updated_at, retired, 1 AS scope_rank
+                        FROM read_parquet('" gpath-r "')")))))
+
+(defn db-upsert-entity!
+  "Upsert an entity row to global or session graph tables.
+   opts: {:scope :global|:session :session-id sid}."
+  [ctx entity {:keys [scope session-id] :or {scope :global}}]
+  (with-provenance "loom.db/db-upsert-entity!" 1
+    (write!
+      (fn []
+        (let [conn         (:conn ctx)
+              sid          (or session-id (:session-id ctx))
+              path         (if (= scope :session)
+                             (session-entities-path ctx sid)
+                             (entities-path ctx))
+              id           (or (:id entity) (uuid))
+              existing-raw (do
+                             (load-entities-table! conn path)
+                             (first (query conn "SELECT * FROM entities WHERE id = ?" id)))
+              existing     (some-> existing-raw entity-row->domain)
+              kind         (normalize-kind (or (:kind entity) (:kind existing) "concept"))
+              aliases      (encode-json-array
+                            (concat (:aliases existing)
+                                    (parse-json-array (:aliases entity))))
+              attrs        (json/encode
+                            (merge (:attrs existing)
+                                   (parse-json-object (:attrs entity))))
+              source-sids  (encode-json-array
+                            (concat (:source_sessions existing)
+                                    (parse-json-array (:source_sessions entity))
+                                    (when sid [sid])))
+              vec-s        (or (normalize-vector-literal (:vector entity))
+                               (normalize-vector-literal (:vector existing-raw)))
+              confidence   (double (or (:confidence entity)
+                                       (:confidence existing)
+                                       0.8))
+              source-inc   (max 1 (int (or (:source_count entity) 1)))
+              source-count (if existing
+                             (+ (int (or (:source_count existing) 0)) source-inc)
+                             source-inc)
+              retired      (boolean (or (:retired entity) false))
+              cname        (or (:canonical_name entity) (:canonical_name existing) id)]
+          (if existing-raw
+            (exec! conn
+              "UPDATE entities
+                 SET canonical_name = ?, kind = ?, aliases = ?, attrs = ?,
+                     vector = ?, confidence = ?, source_count = ?, source_sessions = ?,
+                     updated_at = now(), retired = ?
+               WHERE id = ?"
+              cname kind aliases attrs vec-s confidence source-count source-sids retired id)
+            (exec! conn
+              "INSERT INTO entities (id, canonical_name, kind, aliases, attrs, vector,
+                                     confidence, source_count, source_sessions, retired)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+              id cname kind aliases attrs vec-s confidence source-count source-sids retired))
+          (flush-entities! conn path)
+          id)))))
+
+(defn db-retire-entity!
+  "Mark an entity as retired in global or session scope."
+  [ctx entity-id {:keys [scope session-id] :or {scope :global}}]
+  (with-provenance "loom.db/db-retire-entity!" 1
+    (write!
+      (fn []
+        (let [conn (:conn ctx)
+              sid  (or session-id (:session-id ctx))
+              path (if (= scope :session)
+                     (session-entities-path ctx sid)
+                     (entities-path ctx))]
+          (load-entities-table! conn path)
+          (exec! conn "UPDATE entities SET retired = true, updated_at = now() WHERE id = ?" entity-id)
+          (flush-entities! conn path)
+          entity-id)))))
+
+(defn db-upsert-relation!
+  "Upsert a relation row to global or session graph tables.
+   opts: {:scope :global|:session :session-id sid}."
+  [ctx relation {:keys [scope session-id] :or {scope :global}}]
+  (with-provenance "loom.db/db-upsert-relation!" 1
+    (write!
+      (fn []
+        (let [conn      (:conn ctx)
+              sid       (or session-id (:session-id ctx))
+              path      (if (= scope :session)
+                          (session-relations-path ctx sid)
+                          (relations-path ctx))
+              predicate (normalize-predicate (:predicate relation))
+              relation-id (or (:id relation) (uuid))]
+          (when-not (:subject_id relation)
+            (throw (ex-info "Missing relation subject_id" {:relation relation})))
+          (when-not (:object_id relation)
+            (throw (ex-info "Missing relation object_id" {:relation relation})))
+          (load-relations-table! conn path)
+          (let [existing-raw (or (first (query conn "SELECT * FROM relations WHERE id = ?" relation-id))
+                                 (first (query conn
+                                         "SELECT * FROM relations
+                                          WHERE subject_id = ? AND predicate = ? AND object_id = ?
+                                          ORDER BY created_at DESC
+                                          LIMIT 1"
+                                         (:subject_id relation) predicate (:object_id relation))))
+                existing     (some-> existing-raw relation-row->domain)
+                source-sids  (encode-json-array
+                              (concat (:source_sessions existing)
+                                      (parse-json-array (:source_sessions relation))
+                                      (when sid [sid])))
+                confidence   (double (or (:confidence relation)
+                                         (:confidence existing)
+                                         0.7))
+                retired      (boolean (or (:retired relation) false))
+                rid          (or (:id existing-raw) relation-id)]
+            (if existing-raw
+              (exec! conn
+                "UPDATE relations
+                   SET subject_id = ?, predicate = ?, object_id = ?,
+                       confidence = ?, source_id = ?, source_table = ?,
+                       source_sessions = ?, updated_at = now(), retired = ?
+                 WHERE id = ?"
+                (:subject_id relation)
+                predicate
+                (:object_id relation)
+                confidence
+                (or (:source_id relation) (:source_id existing))
+                (or (:source_table relation) (:source_table existing))
+                source-sids
+                retired
+                rid)
+              (exec! conn
+                "INSERT INTO relations (id, subject_id, predicate, object_id,
+                                        confidence, source_id, source_table,
+                                        source_sessions, retired)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                rid
+                (:subject_id relation)
+                predicate
+                (:object_id relation)
+                confidence
+                (:source_id relation)
+                (:source_table relation)
+                source-sids
+                retired))
+            (flush-relations! conn path)
+            rid))))))
+
+(defn db-get-entity
+  "Get an entity by id with session-first semantics.
+   If session-id is provided: session entities first, then global fallback."
+  [ctx entity-id session-id]
+  (with-provenance "loom.db/db-get-entity" 1
+    (let [conn (:conn ctx)
+          session-path (when session-id (session-entities-path ctx session-id))
+          session-hit (when (and session-path (.exists (io/file session-path)))
+                        (do
+                          (load-entities-table! conn session-path)
+                          (first (query conn
+                                   "SELECT * FROM entities WHERE id = ? AND retired = false"
+                                   entity-id))))]
+      (if session-hit
+        (entity-row->domain session-hit)
+        (let [global-path (entities-path ctx)]
+          (when (.exists (io/file global-path))
+            (load-entities-table! conn global-path)
+            (some-> (first (query conn
+                            "SELECT * FROM entities WHERE id = ? AND retired = false"
+                            entity-id))
+                    entity-row->domain)))))))
+
+(defn db-get-relation
+  "Get a relation by id across session-first (optional) then global."
+  [ctx relation-id session-id]
+  (with-provenance "loom.db/db-get-relation" 1
+    (let [conn (:conn ctx)
+          session-path (when session-id (session-relations-path ctx session-id))
+          session-hit (when (and session-path (.exists (io/file session-path)))
+                        (do
+                          (load-relations-table! conn session-path)
+                          (first (query conn
+                                   "SELECT * FROM relations WHERE id = ? AND retired = false"
+                                   relation-id))))]
+      (if session-hit
+        (relation-row->domain session-hit)
+        (let [global-path (relations-path ctx)]
+          (when (.exists (io/file global-path))
+            (load-relations-table! conn global-path)
+            (some-> (first (query conn
+                            "SELECT * FROM relations WHERE id = ? AND retired = false"
+                            relation-id))
+                    relation-row->domain)))))))
+
+(defn db-list-entities
+  "List entities across scope (:session|:global|:both).
+   opts: {:scope :global|:session|:both :session-id sid :kind \"tool\" :limit 100}."
+  [ctx {:keys [scope session-id kind limit] :or {scope :both limit 100}}]
+  (with-provenance "loom.db/db-list-entities" 1
+    (let [conn (:conn ctx)
+          sid  (when (#{:session :both} scope) (or session-id (:session-id ctx)))]
+      (load-graph-scope! conn ctx sid)
+      (let [rows (query conn "SELECT * FROM graph_entities")
+            scope-filtered (case scope
+                             :session (filter #(= 0 (:scope_rank %)) rows)
+                             :global  (filter #(= 1 (:scope_rank %)) rows)
+                             rows)
+            deduped (->> scope-filtered
+                         (sort-by (juxt :scope_rank :updated_at))
+                         (reduce (fn [acc r]
+                                   (if (contains? acc (:id r)) acc (assoc acc (:id r) r))) {})
+                         vals)
+            filtered (->> deduped
+                          (filter #(not (true? (:retired %))))
+                          (filter #(or (nil? kind) (= (name kind) (:kind %))))
+                          (take (int limit)))]
+        (mapv entity-row->domain filtered)))))
+
+(defn db-search-entities
+  "Semantic search over entities with session-first + global fallback dedupe.
+   opts: {:session-id sid :kind \"concept\"}."
+  [ctx query-vec k {:keys [session-id kind]}]
+  (with-provenance "loom.db/db-search-entities" 1
+    (let [conn  (:conn ctx)
+          vec-s (float-vec->sql query-vec)]
+      (load-graph-scope! conn ctx session-id)
+      (let [kind-clause (if kind " AND kind = ?" "")
+            params      (if kind [(name kind)] [])
+            sql         (str
+                          "WITH ranked AS (\n"
+                          "  SELECT id, canonical_name, kind, aliases, attrs, vector,\n"
+                          "         confidence, source_count, source_sessions,\n"
+                          "         created_at, updated_at, retired, scope_rank,\n"
+                          "         row_number() OVER (PARTITION BY id ORDER BY scope_rank ASC, updated_at DESC) AS rn\n"
+                          "  FROM graph_entities\n"
+                          "  WHERE retired = false AND vector IS NOT NULL" kind-clause "\n"
+                          ")\n"
+                          "SELECT id, canonical_name, kind, aliases, attrs, vector,\n"
+                          "       confidence, source_count, source_sessions,\n"
+                          "       created_at, updated_at, retired\n"
+                          "FROM ranked\n"
+                          "WHERE rn = 1\n"
+                          "ORDER BY array_distance(vector::FLOAT[768], " vec-s "::FLOAT[768])\n"
+                          "LIMIT " (int k))]
+        (->> (apply query conn sql params)
+             (mapv entity-row->domain))))))
+
+(defn db-list-relations
+  "List relations across scope (:session|:global|:both).
+   opts: {:scope :global|:session|:both :session-id sid :limit 200}."
+  [ctx {:keys [scope session-id limit] :or {scope :both limit 200}}]
+  (with-provenance "loom.db/db-list-relations" 1
+    (let [conn (:conn ctx)
+          sid  (when (#{:session :both} scope) (or session-id (:session-id ctx)))]
+      (load-graph-scope! conn ctx sid)
+      (let [rows (query conn "SELECT * FROM graph_relations")
+            scope-filtered (case scope
+                             :session (filter #(= 0 (:scope_rank %)) rows)
+                             :global  (filter #(= 1 (:scope_rank %)) rows)
+                             rows)
+            deduped (->> scope-filtered
+                         (sort-by (juxt :scope_rank :updated_at))
+                         (reduce (fn [acc r]
+                                   (if (contains? acc (:id r)) acc (assoc acc (:id r) r))) {})
+                         vals)
+            filtered (->> deduped
+                          (filter #(not (true? (:retired %))))
+                          (take (int limit)))]
+        (mapv relation-row->domain filtered)))))
+
+(defn db-search-relations
+  "Search relations by optional filters.
+   opts: {:session-id sid :subject-id s :object-id o :predicate p :limit n}."
+  [ctx {:keys [session-id subject-id object-id predicate limit]
+        :or {limit 200}}]
+  (with-provenance "loom.db/db-search-relations" 1
+    (let [conn (:conn ctx)
+          pred (when predicate (normalize-predicate predicate))]
+      (load-graph-scope! conn ctx session-id)
+      (->> (query conn
+             "SELECT id, subject_id, predicate, object_id,
+                     confidence, source_id, source_table, source_sessions,
+                     created_at, updated_at, retired, scope_rank
+              FROM graph_relations
+              WHERE retired = false")
+           (sort-by (juxt :scope_rank :updated_at))
+           (filter #(or (nil? subject-id) (= subject-id (:subject_id %))))
+           (filter #(or (nil? object-id) (= object-id (:object_id %))))
+           (filter #(or (nil? pred) (= pred (:predicate %))))
+           (reduce (fn [acc r]
+                     (if (contains? acc (:id r)) acc (assoc acc (:id r) r))) {})
+           vals
+           (take (int limit))
+           (mapv relation-row->domain)))))
+
+(defn db-merge-entities!
+  "Merge from-id into to-id atomically inside one write! thunk.
+   Rewrites relation subject/object references in selected scope.
+   opts: {:scope :global|:session :session-id sid}."
+  [ctx from-id to-id {:keys [scope session-id] :or {scope :global}}]
+  (with-provenance "loom.db/db-merge-entities!" 1
+    (write!
+      (fn []
+        (if (= from-id to-id)
+          {:merged false :reason :same-id :from-id from-id :to-id to-id}
+          (let [conn          (:conn ctx)
+                sid           (or session-id (:session-id ctx))
+                entity-path   (if (= scope :session)
+                                (session-entities-path ctx sid)
+                                (entities-path ctx))
+                relation-path (if (= scope :session)
+                                (session-relations-path ctx sid)
+                                (relations-path ctx))]
+            (load-entities-table! conn entity-path)
+            (load-relations-table! conn relation-path)
+            (let [from-row (first (query conn "SELECT * FROM entities WHERE id = ?" from-id))
+                  to-row   (first (query conn "SELECT * FROM entities WHERE id = ?" to-id))]
+              (when-not from-row
+                (throw (ex-info "merge source entity not found" {:from-id from-id :scope scope})))
+              (when-not to-row
+                (throw (ex-info "merge target entity not found" {:to-id to-id :scope scope})))
+              (let [from-e         (entity-row->domain from-row)
+                    to-e           (entity-row->domain to-row)
+                    merged-aliases (encode-json-array (concat (:aliases to-e)
+                                                              (:aliases from-e)
+                                                              [(:canonical_name from-e)]))
+                    merged-attrs   (json/encode (merge (:attrs to-e) (:attrs from-e)))
+                    merged-sids    (encode-json-array (concat (:source_sessions to-e)
+                                                              (:source_sessions from-e)))
+                    merged-count   (+ (int (or (:source_count to-e) 0))
+                                      (int (or (:source_count from-e) 0)))
+                    merged-conf    (max (double (or (:confidence to-e) 0.0))
+                                        (double (or (:confidence from-e) 0.0)))]
+                (exec! conn
+                  "UPDATE entities
+                     SET aliases = ?, attrs = ?, source_sessions = ?, source_count = ?,
+                         confidence = ?, updated_at = now()
+                   WHERE id = ?"
+                  merged-aliases merged-attrs merged-sids merged-count merged-conf to-id)
+                (exec! conn
+                  "UPDATE entities
+                     SET retired = true, updated_at = now(), aliases = ?, attrs = ?
+                   WHERE id = ?"
+                  (encode-json-array (concat (:aliases from-e) [(:canonical_name to-e)]))
+                  (json/encode (assoc (:attrs from-e) :merged-into to-id))
+                  from-id)
+                (exec! conn "UPDATE relations SET subject_id = ?, updated_at = now() WHERE subject_id = ?" to-id from-id)
+                (exec! conn "UPDATE relations SET object_id  = ?, updated_at = now() WHERE object_id  = ?" to-id from-id)
+                (flush-entities! conn entity-path)
+                (flush-relations! conn relation-path)
+                {:merged true :from-id from-id :to-id to-id :scope scope}))))))))
+
+(defn db-neighbors
+  "Return one-hop neighbors from graph relations.
+   opts: {:session-id sid :direction :out|:in|:both :predicates [..] :limit n}."
+  [ctx entity-id {:keys [session-id direction predicates limit]
+                  :or {direction :out limit 100}}]
+  (with-provenance "loom.db/db-neighbors" 1
+    (let [conn (:conn ctx)
+          pred-set (when (seq predicates)
+                     (set (map normalize-predicate predicates)))]
+      (load-graph-scope! conn ctx session-id)
+      (->> (query conn
+             "SELECT id, subject_id, predicate, object_id,
+                     confidence, source_id, source_table, source_sessions,
+                     created_at, updated_at, retired, scope_rank
+              FROM graph_relations
+              WHERE retired = false")
+           (sort-by (juxt :scope_rank :updated_at))
+           (filter (fn [r]
+                     (case direction
+                       :out  (= entity-id (:subject_id r))
+                       :in   (= entity-id (:object_id r))
+                       :both (or (= entity-id (:subject_id r))
+                                 (= entity-id (:object_id r)))
+                       (= entity-id (:subject_id r)))))
+           (filter #(or (nil? pred-set) (pred-set (:predicate %))))
+           (map (fn [r]
+                  (assoc (relation-row->domain r)
+                         :neighbor_id (if (= entity-id (:subject_id r))
+                                        (:object_id r)
+                                        (:subject_id r)))))
+           (take (int limit))
+           vec))))
+
+(defn db-bfs
+  "Breadth-first traversal over in-memory graph_relations with cycle checks.
+   opts: {:session-id sid :max-depth 3 :limit 200 :undirected? false}."
+  [ctx start-id {:keys [session-id max-depth limit undirected?]
+                 :or {max-depth 3 limit 200 undirected? false}}]
+  (with-provenance "loom.db/db-bfs" 1
+    (let [conn (:conn ctx)]
+      (load-graph-scope! conn ctx session-id)
+      (let [sql (if undirected?
+                  "WITH RECURSIVE rel_edges AS (
+                     SELECT subject_id, object_id, retired FROM graph_relations
+                     UNION ALL
+                     SELECT object_id AS subject_id, subject_id AS object_id, retired
+                     FROM graph_relations
+                   ),
+                   walk(node_id, depth, path) AS (
+                     SELECT ?::VARCHAR AS node_id,
+                            0::INTEGER AS depth,
+                            [ ?::VARCHAR ]::VARCHAR[] AS path
+                     UNION ALL
+                     SELECT r.object_id AS node_id,
+                            w.depth + 1 AS depth,
+                            array_concat(w.path, [r.object_id]::VARCHAR[]) AS path
+                     FROM walk w
+                     JOIN rel_edges r
+                       ON r.subject_id = w.node_id
+                     WHERE w.depth < ?
+                       AND r.retired = false
+                       AND list_position(w.path, r.object_id) IS NULL
+                   )
+                   SELECT node_id, MIN(depth) AS min_depth
+                   FROM walk
+                   GROUP BY node_id
+                   ORDER BY min_depth ASC, node_id ASC
+                   LIMIT ?"
+                  "WITH RECURSIVE walk(node_id, depth, path) AS (
+                     SELECT ?::VARCHAR AS node_id,
+                            0::INTEGER AS depth,
+                            [ ?::VARCHAR ]::VARCHAR[] AS path
+                     UNION ALL
+                     SELECT r.object_id AS node_id,
+                            w.depth + 1 AS depth,
+                            array_concat(w.path, [r.object_id]::VARCHAR[]) AS path
+                     FROM walk w
+                     JOIN graph_relations r
+                       ON r.subject_id = w.node_id
+                     WHERE w.depth < ?
+                       AND r.retired = false
+                       AND list_position(w.path, r.object_id) IS NULL
+                   )
+                   SELECT node_id, MIN(depth) AS min_depth
+                   FROM walk
+                   GROUP BY node_id
+                   ORDER BY min_depth ASC, node_id ASC
+                   LIMIT ?")]
+        (query conn sql start-id start-id (int max-depth) (int limit))))))
+
+(defn migrate-facts-to-graph!
+  "One-time migration from facts/session_facts parquet into graph tables.
+   Migrates global facts and all sessions/<sid>/facts.parquet files.
+   Returns counts {:global n :sessions {sid n ...}}."
+  [ctx]
+  (with-provenance "loom.db/migrate-facts-to-graph!" 1
+    (let [loom-dir (get-in ctx [:config :loom-dir])
+          gpath    (parquet-path loom-dir :facts)
+          conn     (:conn ctx)
+          global-count
+          (if (.exists (io/file gpath))
+            (let [rows (query conn
+                        (str "SELECT id, content, vector, type, tags, promoted_by, session_id
+                              FROM read_parquet('" gpath "')
+                              WHERE retired = false"))]
+              (doseq [r rows]
+                (let [sid (or (:session_id r) "global")
+                      ent-id (or (:id r) (uuid))]
+                  (unwrap! (db-upsert-entity! ctx
+                            {:id ent-id
+                             :canonical_name (or (:content r) ent-id)
+                             :kind "concept"
+                             :aliases []
+                             :attrs {:type (:type r)
+                                     :tags (parse-json-array (:tags r))
+                                     :promoted_by (:promoted_by r)}
+                             :vector (:vector r)
+                             :confidence 0.8
+                             :source_count 1
+                             :source_sessions [sid]}
+                            {:scope :global}))
+                  (unwrap! (db-upsert-relation! ctx
+                            {:subject_id ent-id
+                             :predicate "MENTIONED_IN"
+                             :object_id ent-id
+                             :confidence 0.8
+                             :source_id ent-id
+                             :source_table "facts"
+                             :source_sessions [sid]}
+                            {:scope :global}))))
+              (count rows))
+            0)
+          sessions-dir (io/file loom-dir "sessions")
+          session-files (if (.exists sessions-dir)
+                          (->> (.listFiles sessions-dir)
+                               (filter #(.isDirectory %))
+                               (map (fn [d]
+                                      {:sid (.getName d)
+                                       :path (str (.getAbsolutePath d) "/facts.parquet")}))
+                               (filter #(-> % :path io/file .exists)))
+                          [])
+          session-counts
+          (reduce (fn [acc {:keys [sid path]}]
+                    (let [rows (query conn
+                               (str "SELECT id, agent_id, content, vector
+                                     FROM read_parquet('" path "')"))]
+                      (doseq [r rows]
+                        (let [ent-id (or (:id r) (uuid))]
+                          (unwrap! (db-upsert-entity! ctx
+                                    {:id ent-id
+                                     :canonical_name (or (:content r) ent-id)
+                                     :kind "concept"
+                                     :aliases []
+                                     :attrs {:agent_id (:agent_id r)}
+                                     :vector (:vector r)
+                                     :confidence 0.7
+                                     :source_count 1
+                                     :source_sessions [sid]}
+                                    {:scope :session :session-id sid}))
+                          (unwrap! (db-upsert-relation! ctx
+                                    {:subject_id ent-id
+                                     :predicate "MENTIONED_IN"
+                                     :object_id ent-id
+                                     :confidence 0.7
+                                     :source_id ent-id
+                                     :source_table "session_facts"
+                                     :source_sessions [sid]}
+                                    {:scope :session :session-id sid}))))
+                      (assoc acc sid (count rows))))
+                  {}
+                  session-files)]
+      {:global global-count
+       :sessions session-counts})))

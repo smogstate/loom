@@ -2,7 +2,7 @@
   "Text manipulation tools."
   (:require [clojure.string :as str]
             [cheshire.core :as json]
-            [loom.envelope :refer [with-provenance]]]))
+            [loom.envelope :refer [with-provenance]]))
 
 (defn split-lines
   "Split text into a vector of non-empty lines."
@@ -13,8 +13,8 @@
     (filterv (complement str/blank?) (str/split-lines text))))
 
 (defn count-tokens
-  "Rough token estimate: word count × 1.3."
-  {:doc "Estimate token count for a string (word-count × 1.3)."
+  "Rough token estimate: word count x 1.3."
+  {:doc "Estimate token count for a string (word-count x 1.3)."
    :tags ["text" "tokens" "count"]}
   [ctx text]
   (with-provenance "loom.seed.text/count-tokens" 1
@@ -33,4 +33,6 @@
 (defn ^{:doc "Convert a string to a URL-friendly slug."
         :tags ["text" "string" "url"]}
   slugify
-  [s] (-> s clojure.string/lower-case (clojure.string/replace #"[^a-z0-9]+" "-")))
+  [ctx s]
+  (with-provenance "loom.seed.text/slugify" 1
+    (-> s str/lower-case (str/replace #"[^a-z0-9]+" "-"))))

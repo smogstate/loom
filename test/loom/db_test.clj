@@ -1,83 +1,116 @@
 (ns loom.db-test
   (:require [clojure.test :refer [deftest is testing use-fixtures]]
             [loom.db :as db]
+            [loom.graph :as graph]
             [loom.envelope :refer [unwrap!]])
   (:import [java.nio.file Files]
            [java.nio.file.attribute FileAttribute]))
 
 (def ^:dynamic *ctx* nil)
 
+(defn- temp-dir []
+  (str (Files/createTempDirectory "loom-kg-test-" (into-array FileAttribute []))))
+
 (defn db-fixture [f]
-  (let [tmp  (str (Files/createTempFile "loom-test-" ".db" (into-array FileAttribute [])))
-        _    (.delete (java.io.File. tmp))   ;; DuckDB needs a non-existent or valid file
-        ds   (db/connect! tmp)
-        _    (db/create-schema! ds)
+  (let [ldir (temp-dir)
+        conn (db/connect!)
         _    (db/start-writer!)
-        tbl  (db/create-session-facts-table! ds "test-session")
-        ctx  {:db                  ds
-              :session-id          "test-session"
-              :session-facts-table tbl}]
+        ctx  {:conn       conn
+              :session-id "s1"
+              :config     {:loom-dir ldir}}]
     (binding [*ctx* ctx]
-      (f))
-    (.delete (java.io.File. tmp))))
+      (f))))
 
 (use-fixtures :each db-fixture)
 
-(deftest table-empty-and-count
-  (is (true? (unwrap! (db/table-empty? *ctx* :tools))))
-  (is (= 0 (unwrap! (db/table-count *ctx* :tools)))))
+(defn- v [x]
+  (vec (repeat 768 x)))
 
-(deftest save-and-search-tool
-  (let [vec  (vec (repeat 768 0.1))
-        id   (unwrap! (db/save-tool! *ctx* {:name "test/tool"
-                                             :doc  "a test tool"
-                                             :tags ["test"]
-                                             :vector vec
-                                             :code "(defn test-tool [] 42)"}))]
-    (is (string? id))
-    (is (= 1 (unwrap! (db/table-count *ctx* :tools))))
-    (let [results (unwrap! (db/search-tools *ctx* vec 5))]
-      (is (= 1 (count results)))
-      (is (= "test/tool" (:name (first results)))))))
+(deftest entity-upsert-and-session-first-lookup
+  (let [eid "entity-1"]
+    (unwrap! (db/db-upsert-entity! *ctx*
+             {:id eid :canonical_name "global-name" :kind "concept" :vector (v 0.1)
+              :confidence 0.9 :source_sessions ["g"]}
+             {:scope :global}))
+    (unwrap! (db/db-upsert-entity! *ctx*
+             {:id eid :canonical_name "session-name" :kind "concept" :vector (v 0.2)
+              :confidence 0.95 :source_sessions ["s1"]}
+             {:scope :session :session-id "s1"}))
+    (let [hit (unwrap! (db/db-get-entity *ctx* eid "s1"))]
+      (is (= "session-name" (:canonical_name hit))))
+    (let [fallback (unwrap! (db/db-get-entity *ctx* eid "other-session"))]
+      (is (= "global-name" (:canonical_name fallback))))))
 
-(deftest tool-versioning
-  (let [vec (vec (repeat 768 0.2))]
-    (unwrap! (db/save-tool! *ctx* {:name "my/fn" :doc "v1" :vector vec :code "v1"}))
-    (unwrap! (db/save-tool! *ctx* {:name "my/fn" :doc "v2" :vector vec :code "v2"}))
-    ;; only one non-retired version
-    (let [results (unwrap! (db/search-tools *ctx* vec 5))]
-      (is (= 1 (count results)))
-      (is (= "v2" (:doc (first results)))))))
+(deftest relation-upsert-and-search
+  (unwrap! (db/db-upsert-entity! *ctx* {:id "a" :canonical_name "A" :kind "concept" :vector (v 0.1)} {:scope :global}))
+  (unwrap! (db/db-upsert-entity! *ctx* {:id "b" :canonical_name "B" :kind "concept" :vector (v 0.1)} {:scope :global}))
+  (unwrap! (db/db-upsert-relation! *ctx*
+           {:subject_id "a" :predicate "USES" :object_id "b" :confidence 1.0
+            :source_id "src1" :source_table "facts" :source_sessions ["s1"]}
+           {:scope :global}))
+  (let [rels (unwrap! (db/db-search-relations *ctx* {:subject-id "a" :predicate "USES" :limit 10}))]
+    (is (= 1 (count rels)))
+    (is (= "b" (:object_id (first rels))))))
 
-(deftest save-and-search-fact
-  (let [vec (vec (repeat 768 0.3))
-        id  (unwrap! (db/save-fact! *ctx* {:content    "service runs on 8080"
-                                            :vector     vec
-                                            :type       "stable"
-                                            :tags       ["config"]
-                                            :promoted-by "user"
-                                            :session-id "test-session"}))]
-    (is (string? id))
-    (let [results (unwrap! (db/search-facts *ctx* vec 5))]
-      (is (= 1 (count results)))
-      (is (= "service runs on 8080" (:content (first results)))))))
+(deftest merge-entities-atomic-and-self-noop
+  (unwrap! (db/db-upsert-entity! *ctx* {:id "e1" :canonical_name "E1" :kind "concept" :vector (v 0.1)
+                                        :source_count 1 :source_sessions ["s1"]}
+           {:scope :global}))
+  (unwrap! (db/db-upsert-entity! *ctx* {:id "e2" :canonical_name "E2" :kind "concept" :vector (v 0.1)
+                                        :source_count 1 :source_sessions ["s2"]}
+           {:scope :global}))
+  (unwrap! (db/db-upsert-relation! *ctx*
+           {:subject_id "e1" :predicate "RELATES_TO" :object_id "e2" :confidence 0.7
+            :source_id "r1" :source_table "facts" :source_sessions ["s1"]}
+           {:scope :global}))
 
-(deftest log-and-search-event
-  (let [vec (vec (repeat 768 0.4))
-        id  (unwrap! (db/log-event! *ctx* {:type       "tool-call"
-                                            :content    "some code"
-                                            :vector     vec
-                                            :session-id "test-session"
-                                            :agent-id   "agent-1"}))]
-    (is (string? id))
-    (let [results (unwrap! (db/search-events *ctx* vec 5))]
-      (is (= 1 (count results))))))
+  (let [noop (unwrap! (db/db-merge-entities! *ctx* "e2" "e2" {:scope :global}))]
+    (is (false? (:merged noop))))
 
-(deftest session-facts
-  (let [vec (vec (repeat 768 0.5))]
-    (unwrap! (db/save-session-fact! *ctx* {:content  "observed: port 9090"
-                                            :vector   vec
-                                            :agent-id "finder"}))
-    (let [results (unwrap! (db/search-session-facts *ctx* vec 5))]
-      (is (= 1 (count results)))
-      (is (= "observed: port 9090" (:content (first results)))))))
+  (let [merged (unwrap! (db/db-merge-entities! *ctx* "e1" "e2" {:scope :global}))
+        e1     (unwrap! (db/db-get-entity *ctx* "e1" nil))
+        e2     (unwrap! (db/db-get-entity *ctx* "e2" nil))
+        rels-e1 (unwrap! (db/db-search-relations *ctx* {:subject-id "e1" :limit 10}))
+        rels-e2 (unwrap! (db/db-search-relations *ctx* {:subject-id "e2" :limit 10}))]
+    (is (true? (:merged merged)))
+    (is (nil? e1))
+    (is (>= (:source_count e2) 2))
+    (is (empty? rels-e1))
+    (is (seq rels-e2))
+    (is (= #{"s1" "s2"} (set (:source_sessions e2))))))
+
+(deftest bfs-traversal-cycle-avoidance
+  (doseq [id ["n1" "n2" "n3"]]
+    (unwrap! (db/db-upsert-entity! *ctx* {:id id :canonical_name id :kind "concept" :vector (v 0.1)} {:scope :global})))
+  (doseq [[s o] [["n1" "n2"] ["n2" "n3"] ["n3" "n1"]]]
+    (unwrap! (db/db-upsert-relation! *ctx* {:subject_id s :predicate "RELATES_TO" :object_id o
+                                            :confidence 1.0 :source_id (str s "->" o)
+                                            :source_table "facts" :source_sessions ["s1"]}
+             {:scope :global})))
+  (let [walk (unwrap! (db/db-bfs *ctx* "n1" {:max-depth 4 :limit 20 :undirected? false}))
+        ids  (set (map :node_id walk))]
+    (is (= #{"n1" "n2" "n3"} ids))))
+
+(deftest auto-promotion-criteria
+  (unwrap! (db/db-upsert-entity! *ctx* {:id "p1" :canonical_name "promotable" :kind "concept"
+                                        :vector (v 0.11) :confidence 0.9
+                                        :source_count 2 :source_sessions ["s1" "s2"]}
+           {:scope :session :session-id "s1"}))
+  (let [res (unwrap! (graph/auto-promote! *ctx* :session-id "s1"))
+        g   (unwrap! (db/db-get-entity *ctx* "p1" nil))]
+    (is (= 1 (:eligible res)))
+    (is (= "promotable" (:canonical_name g)))))
+
+(deftest migrate-facts-to-graph-global-and-session
+  (let [v1 (v 0.2)
+        _ (unwrap! (db/save-fact! *ctx* {:id "f1" :content "global fact"
+                                         :vector v1 :type "stable" :tags ["t1"]
+                                         :promoted-by "user" :session-id "s-global"}))
+        _ (unwrap! (db/save-session-fact! *ctx* {:id "sf1" :agent-id "agent"
+                                                 :content "session fact" :vector v1}))
+        mig (unwrap! (db/migrate-facts-to-graph! *ctx*))
+        ge  (unwrap! (db/db-get-entity *ctx* "f1" nil))
+        se  (unwrap! (db/db-get-entity *ctx* "sf1" "s1"))]
+    (is (= 1 (:global mig)))
+    (is (= "global fact" (:canonical_name ge)))
+    (is (= "session fact" (:canonical_name se)))))

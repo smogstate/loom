@@ -1,5 +1,5 @@
 (ns loom.envelope-test
-  (:require [clojure.test :refer [deftest is testing run-tests]]
+  (:require [clojure.test :refer [deftest is]]
             [loom.envelope :refer [with-provenance ok? unwrap!]]))
 
 (deftest envelope-success
@@ -20,9 +20,9 @@
 
 (deftest envelope-variadic-body
   (let [result (with-provenance "test/multi"
-                 (def x 1)
-                 (def y 2)
-                 (+ x y))]
+                 (let [x 1
+                       y 2]
+                   (+ x y)))]
     (is (true? (:ok? result)))
     (is (= 3 (:result result)))))
 

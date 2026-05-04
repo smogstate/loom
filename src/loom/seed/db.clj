@@ -1,6 +1,7 @@
 (ns loom.seed.db
   "DB search tools exposed to agents — search-tools, search-facts, search-chunks."
   (:require [loom.db :as db]
+            [loom.graph :as graph]
             [loom.embedder :as embedder]
             [loom.envelope :refer [with-provenance unwrap!]]))
 
@@ -22,14 +23,19 @@
       (unwrap! (db/search-tools ctx vec 5)))))
 
 (defn search-facts
-  "Semantic search over global facts."
+  "Semantic search over global concept entities (facts-compatible response)."
   {:doc "Search global facts by semantic similarity. Returns top-k fact records. Content truncated to 300 chars."
    :tags ["db" "search" "facts" "memory"]}
   [ctx query]
   (with-provenance "loom.seed.db/search-facts" 1
-    (let [vec (unwrap! (embedder/embed ctx query))]
-      (mapv #(update % :content truncate)
-            (unwrap! (db/search-facts ctx vec 5))))))
+    (->> (unwrap! (graph/search-entities ctx query 5 :kind :concept))
+         (mapv (fn [e]
+                 {:id       (:id e)
+                  :content  (truncate (:canonical_name e))
+                  :tags     (get-in e [:attrs :tags])
+                  :type     (get-in e [:attrs :type])
+                  :vector   (:vector e)
+                  :session-id (first (:source_sessions e))})))))
 
 (defn search-chunks
   "Semantic search over blob chunks."

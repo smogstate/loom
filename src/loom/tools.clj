@@ -4,6 +4,7 @@
   (:require [clojure.string :as str]
             [loom.state :as state]
             [loom.db :as db]
+            [loom.graph :as graph]
             [loom.embedder :as embedder]
             [loom.envelope :refer [with-provenance unwrap!]]))
 
@@ -26,9 +27,68 @@
                   :vector    vec
                   :code      (str v)
                   :fn        v
-                  :version   1}]
+                  :version   1}
+            agent-id (or (get-in ctx [:agent :id]) "system")]
         (state/add-tool! tool)
-        (unwrap! (db/save-tool! ctx tool))
+        (let [tool-id (unwrap! (db/save-tool! ctx tool))
+              agent-entity-id (str "agent/" agent-id)
+              concept-name (last (str/split name #"/"))]
+          (unwrap! (graph/upsert-entity! ctx
+                    {:id              tool-id
+                     :canonical_name  name
+                     :kind            "tool"
+                     :aliases         [name]
+                     :attrs           {:doc doc :tags tags :code (str v)}
+                     :vector          vec
+                     :confidence      1.0
+                     :source_count    1
+                     :source_sessions [(:session-id ctx)]}
+                    {:scope :global}))
+          (unwrap! (graph/upsert-entity! ctx
+                    {:id              agent-entity-id
+                     :canonical_name  agent-id
+                     :kind            "agent"
+                     :aliases         [agent-id]
+                     :attrs           {}
+                     :confidence      1.0
+                     :source_count    1
+                     :source_sessions [(:session-id ctx)]}
+                    {:scope :global}))
+          (unwrap! (graph/upsert-entity! ctx
+                    {:canonical_name  concept-name
+                     :kind            "concept"
+                     :aliases         [concept-name]
+                     :attrs           {:from_tool name}
+                     :vector          vec
+                     :confidence      1.0
+                     :source_count    1
+                     :source_sessions [(:session-id ctx)]}
+                    {:scope :global}))
+          (let [concept-id (:resolved-id (unwrap! (graph/resolve-entity! ctx
+                                                  {:canonical_name concept-name
+                                                   :kind :concept
+                                                   :aliases [concept-name]
+                                                   :attrs {:from_tool name}
+                                                   :vector vec}
+                                                  {:scope :global})))]
+            (unwrap! (graph/upsert-relation! ctx
+                      {:subject_id      tool-id
+                       :predicate       "AUTHORED_BY"
+                       :object_id       agent-entity-id
+                       :confidence      1.0
+                       :source_id       tool-id
+                       :source_table    "tools"
+                       :source_sessions [(:session-id ctx)]}
+                      {:scope :global}))
+            (unwrap! (graph/upsert-relation! ctx
+                      {:subject_id      tool-id
+                       :predicate       "IMPLEMENTS"
+                       :object_id       concept-id
+                       :confidence      1.0
+                       :source_id       tool-id
+                       :source_table    "tools"
+                       :source_sessions [(:session-id ctx)]}
+                      {:scope :global}))))
         name))))
 
 (defn scan-ns!

@@ -3,8 +3,7 @@
   (:require [clojure.string :as str]
             [clojure.java.io :as io]
             [loom.memory :as memory]
-            [loom.db :as db]
-            [loom.embedder :as embedder]
+            [loom.graph :as graph]
             [loom.envelope :refer [with-provenance unwrap!]]))
 
 (defn- content-hash [s]
@@ -53,10 +52,8 @@
           stored (atom 0)]
       (doseq [chunk chunks]
         (let [h    (content-hash chunk)
-              ;; search to skip already-ingested (by embedding similarity + exact match)
-              vec  (unwrap! (embedder/embed ctx chunk))
-              hits (unwrap! (db/search-facts ctx vec 1))]
-          (when-not (some #(= (:content %) chunk) hits)
+              hits (unwrap! (graph/search-entities ctx chunk 1 :kind :concept))]
+          (when-not (some #(= (:canonical_name %) chunk) hits)
             (unwrap! (memory/promote! ctx chunk
                        {:type    :stable
                         :tags    [project "loom.md"]

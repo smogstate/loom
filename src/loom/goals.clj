@@ -2,6 +2,7 @@
   "Hierarchical goal tracking — create, update, link events, query progress.
    All public fns return envelopes (with-provenance)."
   (:require [loom.db :as db]
+            [loom.graph :as graph]
             [loom.embedder :as embedder]
             [loom.envelope :refer [with-provenance unwrap!]]))
 
@@ -12,22 +13,74 @@
   [ctx {:keys [title description success-criteria parent-id status] :as _opts}]
   (with-provenance "loom.goals/create-goal!" 1
     (let [text (str title "\n" description)
-          vec  (unwrap! (embedder/embed ctx text))]
-      (unwrap! (db/save-goal! ctx
-                 {:title            title
-                  :description      description
-                  :success-criteria success-criteria
-                  :parent-id        parent-id
-                  :status           (or status "open")
-                  :session-id       (:session-id ctx)
-                  :vector           vec})))))
+          vec  (unwrap! (embedder/embed ctx text))
+          goal-id (unwrap! (db/save-goal! ctx
+                     {:title            title
+                      :description      description
+                      :success-criteria success-criteria
+                      :parent-id        parent-id
+                      :status           (or status "open")
+                      :session-id       (:session-id ctx)
+                      :vector           vec}))]
+      (unwrap! (graph/upsert-entity! ctx
+                {:id              goal-id
+                 :canonical_name  title
+                 :kind            "goal"
+                 :aliases         [title]
+                 :attrs           {:description description
+                                   :success_criteria success-criteria
+                                   :status (or status "open")}
+                 :vector          vec
+                 :confidence      1.0
+                 :source_count    1
+                 :source_sessions [(:session-id ctx)]}
+                {:scope :global}))
+      (let [about (unwrap! (graph/resolve-entity! ctx
+                           {:canonical_name title
+                            :kind :concept
+                            :aliases [title]
+                            :attrs {:from_goal goal-id}
+                            :vector vec}
+                           {:scope :global}))]
+        (unwrap! (graph/upsert-relation! ctx
+                  {:subject_id      goal-id
+                   :predicate       "ABOUT"
+                   :object_id       (:resolved-id about)
+                   :confidence      1.0
+                   :source_id       goal-id
+                   :source_table    "goals"
+                   :source_sessions [(:session-id ctx)]}
+                  {:scope :global})))
+      (when parent-id
+        (unwrap! (graph/upsert-relation! ctx
+                  {:subject_id      goal-id
+                   :predicate       "DEPENDS_ON"
+                   :object_id       parent-id
+                   :confidence      1.0
+                   :source_id       goal-id
+                   :source_table    "goals"
+                   :source_sessions [(:session-id ctx)]}
+                  {:scope :global})))
+      goal-id)))
 
 (defn update-status!
   "Transition a goal to a new status. Valid: open|active|blocked|done|abandoned.
    Returns the goal id."
   [ctx goal-id status]
   (with-provenance "loom.goals/update-status!" 1
-    (unwrap! (db/update-goal-status! ctx goal-id status))))
+    (let [updated-id (unwrap! (db/update-goal-status! ctx goal-id status))]
+      (when (= status "done")
+        (let [rels (unwrap! (graph/bfs ctx goal-id
+                                      :session-id (:session-id ctx)
+                                      :max-depth 4
+                                      :limit 500
+                                      :undirected? false))]
+          (doseq [row rels]
+            (when-not (= (:node_id row) goal-id)
+              (unwrap! (graph/promote-entity! ctx (:node_id row)
+                                              :session-id (:session-id ctx)
+                                              :cascade? true))))))
+      updated-id)))
 
 (defn link-event!
   "Attach an existing event to a goal by writing events.goal_id.

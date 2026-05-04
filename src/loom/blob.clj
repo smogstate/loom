@@ -2,11 +2,12 @@
   "Large payload pipeline: ingest to disk, semantic chunk via LLM, embed, search.
    Raw bytes never enter DuckDB or the LLM context directly."
   (:require [clojure.java.io :as io]
-            [clojure.string :as str]
-            [cheshire.core :as json]
-            [loom.db :as db]
-            [loom.embedder :as embedder]
-            [loom.envelope :refer [with-provenance unwrap!]])
+             [clojure.string :as str]
+             [cheshire.core :as json]
+             [loom.db :as db]
+             [loom.graph :as graph]
+             [loom.embedder :as embedder]
+             [loom.envelope :refer [with-provenance unwrap!]])
   (:import [java.security MessageDigest]
            [java.util Base64]
            [java.io ByteArrayOutputStream]
@@ -144,4 +145,63 @@
   (with-provenance "loom.blob/index!" 1
     (let [blob-id (unwrap! (ingest! ctx payload opts))]
       (chunk! ctx blob-id)
+      (let [source     (or (:source opts) "unknown")
+            entity-kind (if (re-find #"^https?://" source) "external" "file")
+            source-entity-id (str "source/" (sha256 (.getBytes source "UTF-8")))]
+        (unwrap! (graph/upsert-entity! ctx
+                  {:id              blob-id
+                   :canonical_name  source
+                   :kind            entity-kind
+                   :aliases         [source]
+                   :attrs           {:blob_id blob-id}
+                   :confidence      1.0
+                   :source_count    1
+                   :source_sessions [(:session-id ctx)]}
+                  {:scope :global}))
+        (unwrap! (graph/upsert-entity! ctx
+                  {:id              source-entity-id
+                   :canonical_name  source
+                   :kind            entity-kind
+                   :aliases         [source]
+                   :attrs           {}
+                   :confidence      1.0
+                   :source_count    1
+                   :source_sessions [(:session-id ctx)]}
+                  {:scope :global}))
+        (unwrap! (graph/upsert-relation! ctx
+                  {:subject_id      blob-id
+                   :predicate       "DEFINED_IN"
+                   :object_id       source-entity-id
+                   :confidence      1.0
+                   :source_id       blob-id
+                   :source_table    "blobs"
+                   :source_sessions [(:session-id ctx)]}
+                  {:scope :global}))
+        (let [chunks (unwrap! (db/list-chunks-by-blob ctx blob-id))]
+          (doseq [c chunks]
+            (let [chunk-id (:id c)
+                  summary  (or (:summary c) (str "chunk-" (:chunk_offset c)))
+                  chunk-entity-id (str "chunk/" chunk-id)]
+              (unwrap! (graph/upsert-entity! ctx
+                        {:id              chunk-entity-id
+                         :canonical_name  summary
+                         :kind            "concept"
+                         :aliases         [summary]
+                         :attrs           {:chunk_id chunk-id
+                                           :blob_id blob-id
+                                           :chunk_offset (:chunk_offset c)}
+                         :vector          (:vector c)
+                         :confidence      1.0
+                         :source_count    1
+                         :source_sessions [(:session-id ctx)]}
+                        {:scope :global}))
+              (unwrap! (graph/upsert-relation! ctx
+                        {:subject_id      chunk-entity-id
+                         :predicate       "MENTIONED_IN"
+                         :object_id       blob-id
+                         :confidence      1.0
+                         :source_id       chunk-id
+                         :source_table    "chunks"
+                         :source_sessions [(:session-id ctx)]}
+                        {:scope :global}))))))
       blob-id)))

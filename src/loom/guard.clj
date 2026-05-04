@@ -307,7 +307,8 @@
    Looks up the (already-wrapped) :fn from loom.state."
   [ctx agent-id tool-name args]
   (with-provenance "loom.guard/call" 1
-    (let [tools (loom.state/get-tools)
+    (let [get-tools-fn (requiring-resolve 'loom.state/get-tools)
+          tools (get-tools-fn)
           tool  (get tools tool-name)]
       (when-not tool
         (throw (ex-info "guard/call: unknown tool" {:tool tool-name})))
