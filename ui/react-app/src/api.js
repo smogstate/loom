@@ -119,3 +119,54 @@ export function hasCachedAttrs(id, opts = {}) {
 export function hasCachedCounts(id, opts = {}) {
   return countsCache.has(cacheKey(id, opts.sessionStack, opts.strict))
 }
+
+// ── promotion ────────────────────────────────────────────────────────────────
+
+export async function apiPromoteEntity(entityId, { sessionStack, sessionId } = {}) {
+  // POST /api/promote/entity/{entityId}?session_ids=…  (or ?session_id=…)
+  // returns { ok, promoted: [id], result }
+  const u = new URL(`${BASE}/api/promote/entity/${encodeURIComponent(entityId)}`, window.location.origin)
+  if (Array.isArray(sessionStack) && sessionStack.length > 0) {
+    u.searchParams.set('session_ids', sessionStack.join(','))
+  }
+  if (sessionId != null) u.searchParams.set('session_id', sessionId)
+  const res = await fetch(u.pathname + u.search, { method: 'POST' })
+  if (!res.ok) {
+    const text = await res.text()
+    throw new Error(`HTTP ${res.status}: ${text}`)
+  }
+  const data = await res.json()
+  // Invalidate all attrsCache / countsCache entries whose key starts with `${entityId}|`
+  const prefix = `${entityId}|`
+  for (const k of attrsCache.keys()) {
+    if (k.startsWith(prefix)) attrsCache.delete(k)
+  }
+  for (const k of countsCache.keys()) {
+    if (k.startsWith(prefix)) countsCache.delete(k)
+  }
+  return data
+}
+
+export async function apiPromoteRelation(relationId, { sessionStack, sessionId } = {}) {
+  // POST /api/promote/relation/{relationId}?session_ids=… (or ?session_id=…)
+  const u = new URL(`${BASE}/api/promote/relation/${encodeURIComponent(relationId)}`, window.location.origin)
+  if (Array.isArray(sessionStack) && sessionStack.length > 0) {
+    u.searchParams.set('session_ids', sessionStack.join(','))
+  }
+  if (sessionId != null) u.searchParams.set('session_id', sessionId)
+  const res = await fetch(u.pathname + u.search, { method: 'POST' })
+  if (!res.ok) {
+    const text = await res.text()
+    throw new Error(`HTTP ${res.status}: ${text}`)
+  }
+  return res.json()
+}
+
+export async function apiCandidates({ sessionId, limit = 100 } = {}) {
+  // GET /api/promotion/candidates?session_id=...&limit=...
+  // returns { candidates: [...] }
+  const u = new URL(`${BASE}/api/promotion/candidates`, window.location.origin)
+  if (sessionId != null) u.searchParams.set('session_id', sessionId)
+  u.searchParams.set('limit', limit)
+  return apiFetch(u.pathname + u.search)
+}

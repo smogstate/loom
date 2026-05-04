@@ -165,7 +165,7 @@
   [ctx entity-id & {:keys [session-id cascade?] :or {cascade? true}}]
   (with-provenance "loom.graph/promote-entity!" 1
     (let [sid        (or session-id (:session-id ctx))
-          read-stack (scope/normalize-stack [sid] :strict? true)
+          read-stack (scope/normalize-stack [sid] :strict? false)
           e (unwrap! (db/db-get-entity ctx entity-id read-stack))]
       (when-not e
         (throw (ex-info "entity not found for promotion" {:entity-id entity-id :session-id sid})))
@@ -184,6 +184,36 @@
                                 (assoc r :source_table (or (:source_table r) "session_facts"))
                                 {:scope :global})))))))))
         global-id))))
+
+(defn ^{:doc "Promote a relation by id from session scope to :global."}
+  promote-relation! [ctx relation-id & {:keys [session-id] :as opts}]
+  (with-provenance "loom.graph/promote-relation!" 1
+    (let [sid        (or session-id (:session-id ctx))
+          read-stack (scope/normalize-stack [sid] :strict? false)
+          r          (unwrap! (db/db-get-relation ctx relation-id read-stack))]
+      (if-not r
+        {:error :not-found :relation-id relation-id :session-id sid}
+        (unwrap! (db/db-upsert-relation! ctx
+                   (assoc r :source_table (or (:source_table r) "session_facts"))
+                   {:scope :global}))))))
+
+(defn ^{:doc "Return entities in the given session(s) that are eligible for promotion to global scope."}
+  list-promotion-candidates [ctx & {:keys [session-id limit] :or {limit 100}}]
+  (with-provenance "loom.graph/list-promotion-candidates" 1
+    (let [sid        (or session-id (:session-id ctx))
+          read-stack (scope/normalize-stack [sid] :strict? true)
+          entities   (unwrap! (db/db-list-entities ctx {:session-ids read-stack :limit 1000}))
+          eligible   (->> entities
+                          (filter entity-eligible-for-promotion?)
+                          (take limit)
+                          (mapv (fn [e]
+                                  (assoc (select-keys e [:id :name :kind :confidence])
+                                         :reason (format "confidence %.2f, %d sources"
+                                                         (double (or (:confidence e) 0.0))
+                                                         (int (or (:source_count e) 0)))))))]
+      {:session-id sid
+       :candidates eligible
+       :count       (count eligible)})))
 
 (defn auto-promote!
   "Auto-promote all session entities passing source/confidence/session thresholds."

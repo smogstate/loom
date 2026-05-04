@@ -303,6 +303,7 @@ export default function App() {
             node={selectedNode.node}
             counts={selectedNode.counts}
             attrs={selectedNode.attrs}
+            sessionStack={sessionStack}
             onClose={() => setSelectedNode(null)}
             onExpand={id => { expandedRef.current.delete(id); expandNode(id) }}
           />

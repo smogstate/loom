@@ -28,11 +28,12 @@
      ;; ensure dirs
      (.mkdirs (io/file loom-dir "sessions" sid))
      (db/start-writer!)
-     {:conn       conn
-      :embedder   (fn [text] (embedder/embed {:config {:ollama-url ollama-url}} text))
-      :state      state/session-state
-      :session-id sid
-      :config     {:models     models
+    {:conn           conn
+     :embedder       (fn [text] (embedder/embed {:config {:ollama-url ollama-url}} text))
+     :state          state/session-state
+     :session-id     sid
+     :promotion-mode (atom :off)
+     :config         {:models     models
                    :ollama-url ollama-url
                    :loom-dir   loom-dir
                    :max-turns  20}})))

@@ -522,13 +522,16 @@ def all_entities(
         if not eid or eid in seen:
             continue
         seen.add(eid)
+        src_sessions = item.get("source_sessions", [])
+        scope = "global" if any(s == GLOBAL_SID for s in src_sessions) else "session"
         entities.append({
             "id": eid,
             "canonical_name": item.get("canonical_name", ""),
             "label": item.get("canonical_name") or eid,
             "kind": item.get("kind", ""),
             "attrs": item.get("attrs", {}),
-            "source_sessions": item.get("source_sessions", []),
+            "source_sessions": src_sessions,
+            "scope": scope,
         })
     return {"entities": entities, "count": len(entities)}
 
@@ -565,6 +568,13 @@ def get_entity(
     if data is None:
         raise HTTPException(status_code=404, detail="Entity not found")
 
+    # Derive scope: "global" if any source session is the global SID, else "session"
+    src_sessions = data.get("source_sessions", []) if isinstance(data, dict) else []
+    scope = "global" if any(s == GLOBAL_SID for s in src_sessions) else "session"
+    if isinstance(data, dict):
+        data = dict(data)
+        data["scope"] = scope
+
     return data
 
 
@@ -597,6 +607,122 @@ def neighbor_counts(
         inner = {}
 
     return {"in": inner.get("in", 0), "out": inner.get("out", 0)}
+
+
+# ── /api/promote/entity/{entity_id} ──────────────────────────────────────────
+
+@app.post("/api/promote/entity/{entity_id}")
+def promote_entity(
+    entity_id: str,
+    session_id: Optional[str] = Query(None, description="Explicit session id to promote from (hint)"),
+    session_ids: Optional[str] = Query(None, description="CSV of session ids (current UI stack); used as hint"),
+):
+    # Build a hint list from query params. The Clojure side will pick the
+    # first hint that actually appears in the entity's source_sessions; if
+    # none match, it falls back to the entity's own first non-global source.
+    hints: list[str] = []
+    if session_id:
+        hints.append(session_id)
+    if session_ids:
+        hints.extend(s for s in _parse_session_ids(session_ids) if s and s != GLOBAL_SID)
+    hints_clj = "[" + " ".join(_clj_str(h) for h in hints) + "]"
+
+    code = (
+        f'(let [eid    {_clj_str(entity_id)}'
+        f'      hints  {hints_clj}'
+        f'      e      (loom.envelope/unwrap!'
+        f'              (loom.db/db-get-entity ctx eid'
+        f'                (loom.scope/normalize-stack [] :strict? false)))'
+        f'      _      (when-not e'
+        f'               (throw (ex-info "entity not found"'
+        f'                        {{:entity-id eid :hints hints}})))'
+        f'      sources (vec (remove #{{"{GLOBAL_SID}"}} (:source_sessions e)))'
+        f'      hit    (first (filter (set sources) hints))'
+        f'      sid    (or hit (first sources))'
+        f'      _      (when-not sid'
+        f'               (throw (ex-info "entity has no session source"'
+        f'                        {{:entity-id eid :sources (:source_sessions e)}})))]'
+        f'  (loom.envelope/unwrap!'
+        f'    (loom.graph/promote-entity! ctx eid :session-id sid :cascade? true)))'
+    )
+    result, errors = nrepl_eval_locked(code)
+    if errors and not result:
+        raise HTTPException(status_code=502, detail={"nrepl_errors": errors})
+
+    try:
+        data = _parse_edn(result) if result else None
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail={"parse_error": str(exc), "raw": result})
+
+    data = _unwrap_envelope(data) if isinstance(data, dict) else data
+    return {"ok": True, "promoted": [entity_id], "result": data}
+
+
+# ── /api/promote/relation/{relation_id} ──────────────────────────────────────
+
+@app.post("/api/promote/relation/{relation_id}")
+def promote_relation(
+    relation_id: str,
+    session_id: Optional[str] = Query(None, description="Session id to promote from"),
+):
+    sid_fragment = f" :session-id {_clj_str(session_id)}" if session_id else ""
+    code = (
+        f'(loom.envelope/unwrap! (loom.graph/promote-relation! ctx {_clj_str(relation_id)}'
+        f'{sid_fragment}))'
+    )
+    result, errors = nrepl_eval_locked(code)
+    if errors and not result:
+        raise HTTPException(status_code=502, detail={"nrepl_errors": errors})
+
+    try:
+        data = _parse_edn(result) if result else None
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail={"parse_error": str(exc), "raw": result})
+
+    data = _unwrap_envelope(data) if isinstance(data, dict) else data
+    return {"ok": True, "promoted": [relation_id], "result": data}
+
+
+# ── /api/promotion/candidates ────────────────────────────────────────────────
+
+@app.get("/api/promotion/candidates")
+def promotion_candidates(
+    session_id: Optional[str] = Query(None, description="Session id to scope candidates"),
+    limit: int = Query(100),
+):
+    if session_id:
+        code = (
+            f'(loom.envelope/unwrap! (loom.graph/list-promotion-candidates ctx'
+            f' :session-id {_clj_str(session_id)} :limit {limit}))'
+        )
+    else:
+        code = f'(loom.envelope/unwrap! (loom.graph/list-promotion-candidates ctx :limit {limit}))'
+
+    result, errors = nrepl_eval_locked(code)
+    if errors and not result:
+        raise HTTPException(status_code=502, detail={"nrepl_errors": errors})
+
+    try:
+        data = _parse_edn(result) if result else []
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail={"parse_error": str(exc), "raw": result})
+
+    inner = _unwrap_envelope(data) if isinstance(data, dict) else data
+    if not isinstance(inner, list):
+        inner = []
+
+    candidates = []
+    for item in inner:
+        if not isinstance(item, dict):
+            continue
+        candidates.append({
+            "id": item.get("id"),
+            "name": item.get("name"),
+            "kind": item.get("kind"),
+            "confidence": item.get("confidence"),
+            "reason": item.get("reason"),
+        })
+    return {"candidates": candidates}
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────

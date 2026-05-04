@@ -31,3 +31,21 @@
                                     :session-ids [(:session-id ctx)]
                                     :strict? true
                                     :kind :concept))))
+
+(def ^:private valid-promotion-modes #{:off :suggest :auto})
+
+(defn get-promotion-mode
+  "Return the current promotion mode for ctx. One of :off, :suggest, :auto."
+  [ctx]
+  (with-provenance "loom.session/get-promotion-mode" 1
+    @(:promotion-mode ctx)))
+
+(defn set-promotion-mode!
+  "Set the promotion mode on ctx. Must be one of :off, :suggest, :auto."
+  [ctx mode]
+  (with-provenance "loom.session/set-promotion-mode!" 1
+    (when-not (valid-promotion-modes mode)
+      (throw (ex-info "Invalid promotion-mode"
+                      {:mode mode :valid valid-promotion-modes})))
+    (reset! (:promotion-mode ctx) mode)
+    mode))
