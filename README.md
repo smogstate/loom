@@ -3,8 +3,8 @@
 Loom is a semantic memory and tool registry for AI agents, designed to be called over nREPL from an external agent (e.g. OpenCode).
 
 It gives agents:
-- **Persistent memory** across sessions (facts, events, session notes)
-- **Semantic search** over memory and tools using local embeddings
+- **Knowledge graph memory** across sessions (`entities` + `relations`, session-first reads)
+- **Semantic search** over graph memory and tools using local embeddings
 - **A tool registry** — agents discover, register, and reuse Clojure functions
 - **Blob ingestion** — chunk and embed documents for RAG
 - **Goal tracking** — hierarchical goals with status transitions and event linkage
@@ -21,11 +21,12 @@ External agent (OpenCode / human at REPL)
   │  nREPL :7888
   ▼
 loom.core/start!
-  ├── loom.db          — DuckDB engine over parquet files (.loom/*.parquet, sessions/)
+  ├── loom.db          — DuckDB over parquet files (tools, goals, chunks, events, KG tables)
+  ├── loom.graph       — KG APIs: extract/link, resolve/merge, promote, traversal
   ├── loom.embedder    — Ollama nomic-embed-text (768-dim)
   ├── loom.tools       — register!, scan-ns!, search
-  ├── loom.session     — per-session fact logging (tier 2 memory)
-  ├── loom.memory      — promote to global facts, forget, suggest
+  ├── loom.session     — per-session observation logging + session KG entities
+  ├── loom.memory      — promote/search/forget over global KG entities
   ├── loom.blob        — ingest documents, chunk, embed
   ├── loom.state       — in-process atom mirror of tool registry
   ├── loom.scratch     — session-scoped tool creation, hit tracking, promotion
@@ -39,21 +40,25 @@ loom.core/start!
 | Tier | Namespace | Storage | Scope |
 |---|---|---|---|
 | 1 — Scratch | `loom.scratch` | `scratch/*.clj` + session `hits.parquet` | Session (persisted, not promoted) |
-| 2 — Session | `loom.session` | DuckDB session facts parquet | Current session |
-| 3 — Global | `loom.memory` | DuckDB global facts parquet | All sessions |
+| 2 — Session | `loom.session`, `loom.graph` | `.loom/sessions/<id>/{entities,relations}.parquet` | Current session |
+| 3 — Global | `loom.memory`, `loom.graph` | `.loom/{entities,relations}.parquet` | All sessions |
 
 ### Parquet files
 
 | File | Contents |
 |---|---|
 | `.loom/tools.parquet` | Registered tool definitions |
-| `.loom/facts.parquet` | Global promoted facts |
+| `.loom/entities.parquet` | Global KG entities (memory system of record) |
+| `.loom/relations.parquet` | Global KG relations (memory system of record) |
 | `.loom/events.parquet` | Audit trail (findings, conclusions, approvals) |
 | `.loom/chunks.parquet` | Blob document chunks for RAG |
 | `.loom/goals.parquet` | Hierarchical goals |
 | `.loom/usage.parquet` | Per-agent tool call usage (budget) |
-| `.loom/sessions/<id>/facts.parquet` | Session-scoped facts |
+| `.loom/sessions/<id>/entities.parquet` | Session KG entities |
+| `.loom/sessions/<id>/relations.parquet` | Session KG relations |
 | `.loom/sessions/<id>/hits.parquet` | Scratch tool hit counts |
+| `.loom/facts.parquet` | Legacy facts store (migration source / compatibility) |
+| `.loom/sessions/<id>/facts.parquet` | Legacy session facts store (migration source / compatibility) |
 
 ---
 
@@ -73,7 +78,7 @@ loom.core/start!
 ```sh
 git clone https://github.com/smogstate/loom loom
 cd loom
-clojure -M:dev   # starts nREPL via dev/dev.clj
+clojure -M:dev -e "(require 'dev) (dev/start!)"   # starts Loom + nREPL via dev/dev.clj
 ```
 
 Or start programmatically from another process:
@@ -100,7 +105,7 @@ Connect to nREPL on port 7888, then:
 ### Find relevant tools
 ```clojure
 (def q (unwrap! (embedder/embed ctx "parse csv")))
-(db/search-tools ctx q 5)
+(unwrap! (db/search-tools ctx q 5))
 ```
 
 ### Register a new tool
@@ -110,7 +115,7 @@ Connect to nREPL on port 7888, then:
   (with-provenance "parse-csv" 1
     (map #(clojure.string/split % #",") (clojure.string/split-lines s))))
 
-(tools/register! ctx #'parse-csv)
+(tools/register! ctx 'user/parse-csv)
 ```
 
 ### Log a session observation
@@ -130,7 +135,7 @@ Connect to nREPL on port 7888, then:
 
 ### Ingest a document
 ```clojure
-(blob/ingest! ctx "docs/spec.md" {:project "myapp"})
+(blob/index! ctx (slurp "docs/spec.md") {:source "docs/spec.md"})
 ```
 
 ### Index all project source files
@@ -158,7 +163,7 @@ Connect to nREPL on port 7888, then:
                                            :status      "open"})))
 
 (goals/update-status! ctx gid "active")
-(goals/link-event!    ctx gid event-id)
+(goals/link-event!    ctx event-id gid)
 ```
 
 ### Meter agent tool calls (budget)
@@ -224,11 +229,12 @@ Use `(unwrap! envelope)` to get the result or throw on failure.
 ```
 src/loom/
   core.clj       — start!, make-ctx, bootstrap!
-  db.clj         — DuckDB schema, write queue, all save/search fns
+  db.clj         — DuckDB parquet IO, KG tables, merge/traversal/migration helpers
+  graph.clj      — KG orchestration APIs (resolve, merge, promote, BFS, extraction)
   embedder.clj   — Ollama HTTP embed call
   envelope.clj   — with-provenance macro, unwrap!
-  memory.clj     — promote!, forget!, search (global facts)
-  session.clj    — log-fact!, search-facts (session-scoped)
+  memory.clj     — promote!, forget!, search (global KG concepts)
+  session.clj    — log-fact!, search-facts (session KG concepts)
   state.clj      — in-process atom tool registry
   tools.clj      — register!, scan-ns!, start-watcher!
   blob.clj       — ingest!, chunk!, embed documents
