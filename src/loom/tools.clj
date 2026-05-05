@@ -2,15 +2,26 @@
   "Tool registry: register, scan namespaces, rollback, search.
    The runtime mirror in loom.state is kept in sync with DuckDB."
   (:require [clojure.string :as str]
+            [cheshire.core :as json]
             [loom.state :as state]
-            [loom.db :as db]
-            [loom.graph :as graph]
+            [loom.kg :as kg]
             [loom.embedder :as embedder]
             [loom.envelope :refer [with-provenance unwrap!]]))
 
+(defn- vec->sql-literal [v]
+  (when (and v (seq v))
+    (str "[" (str/join ", " (map float v)) "]::FLOAT[768]")))
+
 (defn register!
   "Register a var as a tool: embed its doc+tags, store in DuckDB and state mirror.
-   var-sym must be a fully-qualified symbol, e.g. 'loom.seed.math/compound-interest."
+   var-sym must be a fully-qualified symbol, e.g. 'loom.seed.math/compound-interest.
+
+   All persistent writes — tool row, three KG entities (tool/agent/concept),
+   two relations — execute inside ONE `kg/write!` thunk so that the API-layer
+   endpoint check in `kg/upsert-relation*` sees its referent entities (which
+   were inserted earlier in the same thunk) and the whole compound write is
+   atomic. Entity ids are deterministic (`tool/<name>`, `agent/<id>`,
+   `concept/<name>`) so re-registration is idempotent without fuzzy resolve."
   [ctx var-sym]
   (with-provenance "loom.tools/register!" 1
     (let [v    (resolve var-sym)
@@ -20,76 +31,62 @@
           doc  (or (:doc m) "")
           tags (or (:tags m) [])
           text (str/join " " [name doc (str/join " " tags)])
-          vec  (unwrap! (embedder/embed ctx text))]
-      (let [tool {:name      name
-                  :doc       doc
-                  :tags      tags
-                  :vector    vec
-                  :code      (str v)
-                  :fn        v
-                  :version   1}
-            agent-id (or (get-in ctx [:agent :id]) "system")]
-        (state/add-tool! tool)
-        (let [tool-id (unwrap! (db/save-tool! ctx tool))
-              agent-entity-id (str "agent/" agent-id)
-              concept-name (last (str/split name #"/"))]
-          (unwrap! (graph/upsert-entity! ctx
-                    {:id              tool-id
-                     :canonical_name  name
-                     :kind            "tool"
-                     :aliases         [name]
-                     :attrs           {:doc doc :tags tags :code (str v)}
-                     :vector          vec
-                     :confidence      1.0
-                     :source_count    1
-                     :source_sessions [(:session-id ctx)]}
-                    {:scope :global}))
-          (unwrap! (graph/upsert-entity! ctx
-                    {:id              agent-entity-id
-                     :canonical_name  agent-id
-                     :kind            "agent"
-                     :aliases         [agent-id]
-                     :attrs           {}
-                     :confidence      1.0
-                     :source_count    1
-                     :source_sessions [(:session-id ctx)]}
-                    {:scope :global}))
-          (unwrap! (graph/upsert-entity! ctx
-                    {:canonical_name  concept-name
-                     :kind            "concept"
-                     :aliases         [concept-name]
-                     :attrs           {:from_tool name}
-                     :vector          vec
-                     :confidence      1.0
-                     :source_count    1
-                     :source_sessions [(:session-id ctx)]}
-                    {:scope :global}))
-          (let [concept-id (:resolved-id (unwrap! (graph/resolve-entity! ctx
-                                                  {:canonical_name concept-name
-                                                   :kind :concept
-                                                   :aliases [concept-name]
-                                                   :attrs {:from_tool name}
-                                                   :vector vec}
-                                                  {:scope :global})))]
-            (unwrap! (graph/upsert-relation! ctx
-                      {:subject_id      tool-id
-                       :predicate       "AUTHORED_BY"
-                       :object_id       agent-entity-id
-                       :confidence      1.0
-                       :source_id       tool-id
-                       :source_table    "tools"
-                       :source_sessions [(:session-id ctx)]}
-                      {:scope :global}))
-            (unwrap! (graph/upsert-relation! ctx
-                      {:subject_id      tool-id
-                       :predicate       "IMPLEMENTS"
-                       :object_id       concept-id
-                       :confidence      1.0
-                       :source_id       tool-id
-                       :source_table    "tools"
-                       :source_sessions [(:session-id ctx)]}
-                      {:scope :global}))))
-        name))))
+          vec  (unwrap! (embedder/embed ctx text))
+          tool {:name name :doc doc :tags tags :vector vec
+                :code (str v) :fn v :version 1}
+          agent-id        (or (get-in ctx [:agent :id]) "system")
+          tool-id         (str "tool/" name)
+          agent-entity-id (str "agent/" agent-id)
+          concept-name    (last (str/split name #"/"))
+          concept-id      (str "concept/" concept-name)
+          tags-json       (json/encode tags)
+          vec-frag        (vec->sql-literal vec)]
+      (state/add-tool! tool)
+      (kg/write!
+        (fn []
+          (let [conn (:db-conn ctx)]
+            ;; tool row — DELETE+INSERT pattern (FLOAT[768] update unsupported)
+            (kg/exec! conn "DELETE FROM tools WHERE id = ?" tool-id)
+            (kg/exec! conn
+                      (str "INSERT INTO tools
+                              (id, name, doc, tags, vector, code, version)
+                              VALUES (?, ?, ?, ?, " vec-frag ", ?, 1)")
+                      tool-id name doc tags-json (str v))
+            ;; KG entities — must precede their relations (endpoint check).
+            (kg/upsert-entity* ctx
+              {:id tool-id
+               :kind "tool"
+               :canonical_name name
+               :aliases [name]
+               :attrs {:doc doc :tags tags :code (str v)}
+               :vector vec})
+            (kg/upsert-entity* ctx
+              {:id agent-entity-id
+               :kind "agent"
+               :canonical_name agent-id
+               :aliases [agent-id]
+               :attrs {}})
+            (kg/upsert-entity* ctx
+              {:id concept-id
+               :kind "concept"
+               :canonical_name concept-name
+               :aliases [concept-name]
+               :attrs {:from_tool name}
+               :vector vec})
+            ;; relations — both endpoints exist by now in this thunk.
+            (kg/upsert-relation* ctx
+              {:id (str "rel/" tool-id "/AUTHORED_BY/" agent-entity-id)
+               :subject_id tool-id
+               :predicate "AUTHORED_BY"
+               :object_id agent-entity-id
+               :attrs {:source_table "tools"}})
+            (kg/upsert-relation* ctx
+              {:id (str "rel/" tool-id "/IMPLEMENTS/" concept-id)
+               :subject_id tool-id
+               :predicate "IMPLEMENTS"
+               :object_id concept-id
+               :attrs {:source_table "tools"}}))))
+      name)))
 
 (defn scan-ns!
   "Register all public vars with :doc metadata in the given namespace."
@@ -104,28 +101,10 @@
             (swap! registered conj sym))))
       @registered)))
 
-(defn rollback!
-  "Roll back a tool to a previous version by id."
-  [ctx tool-name previous-id]
-  (with-provenance "loom.tools/rollback!" 1
-    (unwrap! (db/rollback-tool! ctx tool-name previous-id))))
-
-;; ---------------------------------------------------------------------------
-;; Watcher — auto-persist new tools added to state at runtime
-;; ---------------------------------------------------------------------------
-
-(defn start-watcher!
-  "Add a watch on session-state that persists newly registered tools to DuckDB.
-   NOTE: tools observed here have already been wrapped by loom.guard/wrap-tool
-   inside loom.state/add-tool!, so db/save-tool! will persist the guarded :fn.
-   Do not unwrap."
-  [ctx]
-  (add-watch state/session-state :tool-vectorizer
-    (fn [_ _ old new]
-      (let [added (clojure.set/difference
-                    (set (keys (:tools new)))
-                    (set (keys (:tools old))))]
-        (doseq [tool-name added]
-          (let [tool (get-in new [:tools tool-name])]
-            (when (and tool (:vector tool))
-              (db/save-tool! ctx tool))))))))
+;; rollback! and start-watcher! removed in v2.
+;;   - rollback!: register! uses deterministic ids + DELETE+INSERT, so prior
+;;     versions are not retained. Re-introduce when DuckDB supports UPDATE
+;;     on FLOAT[768] (and we re-add a versioning shape to the tools table).
+;;   - start-watcher!: there is no longer a "side door" for putting tools
+;;     into the runtime mirror without persisting. `register!` is the only
+;;     sanctioned path; it writes both the runtime mirror and the DB.

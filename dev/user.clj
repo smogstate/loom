@@ -2,8 +2,7 @@
   "REPL utilities. Loom should be started via OpenCode commands (/loom-init, /start-loom)."
   (:require [dev]
             [loom.core :as loom]
-            [loom.db :as db]
-            [loom.graph :as graph]))
+            [loom.kg :as kg]))
 
 (defonce ctx nil)
 

@@ -14,7 +14,7 @@
             [clojure.string   :as str]
             [clojure.walk     :as walk]
             [loom.envelope    :refer [with-provenance]]
-            [loom.db          :as db]))
+            [loom.audit       :as audit]))
 
 ;; ---------------------------------------------------------------------------
 ;; Policy + rate-limit state
@@ -219,14 +219,13 @@
 ;; ---------------------------------------------------------------------------
 
 (defn- log-redaction!
-  "Fire-and-forget: log a redaction event to events.parquet."
+  "Fire-and-forget: log a redaction event to the audit log."
   [ctx agent-id tool-name pattern-name]
   (try
-    (db/log-event! ctx {:type       "guard.redaction"
-                        :agent-id   agent-id
-                        :session-id (:session-id ctx)
-                        :content    (pr-str {:tool         tool-name
-                                             :pattern-name pattern-name})})
+    (audit/log! ctx {:type     "guard.redaction"
+                     :agent-id agent-id
+                     :content  (pr-str {:tool         tool-name
+                                        :pattern-name pattern-name})})
     (catch Exception _ nil)))
 
 (defn redact
@@ -255,15 +254,14 @@
 ;; ---------------------------------------------------------------------------
 
 (defn log-denial!
-  "Write a guard.denial event to events.parquet."
+  "Write a guard.denial event to the audit log."
   [ctx agent-id tool-name reason detail]
   (try
-    (db/log-event! ctx {:type       "guard.denial"
-                        :agent-id   agent-id
-                        :session-id (:session-id ctx)
-                        :content    (pr-str {:tool   tool-name
-                                             :reason reason
-                                             :detail detail})})
+    (audit/log! ctx {:type     "guard.denial"
+                     :agent-id agent-id
+                     :content  (pr-str {:tool   tool-name
+                                        :reason reason
+                                        :detail detail})})
     (catch Exception _ nil)))
 
 ;; ---------------------------------------------------------------------------
@@ -319,26 +317,19 @@
 ;; ---------------------------------------------------------------------------
 
 (defn search-denials
-  "Return recent guard.denial and guard.redaction events from events.parquet.
-   Filters by SQL — no embedding required. Results newest-first.
+  "Return recent guard.denial and guard.redaction audit rows.
+   Backed by `loom.audit/query`. Results newest-first.
 
-   opts: {:agent-id str :tool str :since inst-ms :limit int}"
+   opts: {:agent-id str :tool str :since inst-ms :limit int}.
+   `:tool` matches via substring on `content`."
   ([ctx]            (search-denials ctx {}))
-  ([ctx {:keys [agent-id tool limit since]
-         :or   {limit 100}}]
+  ([ctx {:keys [agent-id tool limit since] :or {limit 100}}]
    (with-provenance "loom.guard/search-denials" 1
-     (let [conn   (db/connection ctx)
-           path   (db/events-path ctx)
-           wheres (cond-> ["type IN ('guard.denial', 'guard.redaction')"]
-                    agent-id (conj "agent_id = ?")
-                    since    (conj "ts >= ?")
-                    tool     (conj "content LIKE ?"))
-           params (cond-> []
-                    agent-id (conj agent-id)
-                    since    (conj since)
-                    tool     (conj (str "%" tool "%")))
-           sql    (str "SELECT id, ts, agent_id, type, content "
-                       "FROM read_parquet('" path "') "
-                       "WHERE " (str/join " AND " wheres) " "
-                       "ORDER BY ts DESC LIMIT " (long limit))]
-       (db/query-raw conn sql params)))))
+     (let [env  (audit/query ctx {:types ["guard.denial" "guard.redaction"]
+                                  :agent-id agent-id
+                                  :since since
+                                  :limit limit})
+           rows (:result env)]
+       (if tool
+         (filterv #(str/includes? (or (:content %) "") tool) rows)
+         rows)))))

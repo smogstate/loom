@@ -4,8 +4,8 @@
   (:require [clojure.java.io :as io]
              [clojure.string :as str]
              [cheshire.core :as json]
-             [loom.db :as db]
-             [loom.graph :as graph]
+             [loom.kg :as kg]
+             [loom.audit :as audit]
              [loom.embedder :as embedder]
              [loom.envelope :refer [with-provenance unwrap!]])
   (:import [java.security MessageDigest]
@@ -85,36 +85,76 @@
     (mapv #(first (str/split-lines %)) chunks)))
 
 ;; ---------------------------------------------------------------------------
-;; Public API
+;; Public API — v2 file-backed conn (.loom/loom.db)
+;;
+;; Storage migration only (cutover step 3b).  KG `file`/`chunk` entity
+;; creation that previously lived in `index!` is deferred to the future
+;; `loom.ingest` namespace; users who want the KG side now should call
+;; `kg/upsert-entity!` directly.  Trigger semantics (when/who/how often
+;; ingestion runs) are unchanged.
 ;; ---------------------------------------------------------------------------
 
+(defn- vec->sql-literal [v]
+  (when (and v (seq v))
+    (str "[" (str/join ", " (map float v)) "]::FLOAT[768]")))
+
+(defn- get-blob-row
+  "Fetch a single blob row from the file-backed conn. Returns map or nil."
+  [conn blob-id]
+  (first (kg/query conn
+                   "SELECT id, path, source, size_bytes, ts FROM blobs WHERE id = ?"
+                   blob-id)))
+
+(defn- completed-offsets
+  "Return a set of chunk_offset ints already written for this blob."
+  [conn blob-id]
+  (->> (kg/query conn
+                 "SELECT chunk_offset FROM chunks WHERE blob_id = ?"
+                 blob-id)
+       (map :chunk_offset)
+       set))
+
 (defn ingest!
-  "Store raw payload (String or bytes) to disk, index metadata in DuckDB.
-   Returns envelope with blob-id."
-  [ctx payload {:keys [source agent-id]}]
+  "Store raw payload (String or bytes) to disk, index metadata in the
+   file-backed DB. Returns envelope with blob-id."
+  [ctx payload {:keys [source]}]
   (with-provenance "loom.blob/ingest!" 1
-    (let [data  (if (string? payload) (.getBytes payload "UTF-8") payload)
-          id    (sha256 data)
-          ldir  (get-in ctx [:config :loom-dir] ".loom")
-          path  (str ldir "/blobs/" (date-path) "/" id ".gz")]
+    (let [data (if (string? payload) (.getBytes payload "UTF-8") payload)
+          id   (sha256 data)
+          ldir (get-in ctx [:config :loom-dir] ".loom")
+          path (str ldir "/blobs/" (date-path) "/" id ".gz")
+          src  (or source "unknown")
+          size (count data)]
       (write-gzip! path data)
-      (unwrap! (db/save-blob! ctx {:id         id
-                                   :path       path
-                                   :source     (or source "unknown")
-                                   :agent-id   (or agent-id (get-in ctx [:agent :id]))
-                                   :size-bytes (count data)}))
+      (kg/write!
+        (fn []
+          (let [conn (:db-conn ctx)]
+            (kg/exec! conn "DELETE FROM blobs WHERE id = ?" id)
+            (kg/exec! conn
+                      "INSERT INTO blobs (id, path, source, size_bytes)
+                       VALUES (?, ?, ?, ?)"
+                      id path src size))))
       id)))
 
-(defn chunk!
-  "Semantically chunk a blob, summarize each chunk with LLM (batched), embed and store.
-   Resumes from last completed offset if interrupted."
+(defn ^{:deprecated "v2 — superseded by loom.ingest/ingest-document!. Will be removed when ingest-codebase! lands."}
+  chunk!
+  "DEPRECATED.  Semantically chunk a blob, summarise each chunk with LLM,
+   embed, and store chunk rows.  Resumes from last completed offset.
+
+   Use `loom.ingest/ingest-document!` for markdown / plain-text instead —
+   it does heading-aware structural chunking, creates KG `concept` entities
+   linked to a `file` entity, and is the v2 canonical authored-content path.
+   This fn remains only for `loom.blob/index!`; both will be removed when
+   `loom.ingest/ingest-codebase!` lands and absorbs source-file ingestion."
   [ctx blob-id]
   (with-provenance "loom.blob/chunk!" 1
-    (let [blob      (unwrap! (db/get-blob ctx blob-id))
+    (let [conn      (:db-conn ctx)
+          blob      (or (get-blob-row conn blob-id)
+                        (throw (ex-info "blob not found" {:blob-id blob-id})))
           text      (read-raw ctx blob)
           chunks    (semantic-split ctx text (:source blob))
           batches   (partition-all 20 (map-indexed vector chunks))
-          done-set  (unwrap! (db/completed-offsets ctx blob-id))]
+          done-set  (completed-offsets conn blob-id)]
       (doseq [batch batches]
         (let [new-batch (remove #(done-set (first %)) batch)]
           (when (seq new-batch)
@@ -122,86 +162,43 @@
                   summaries  (try
                                (summarize-batch ctx raw-chunks)
                                (catch Exception _
-                                 ;; fallback: use raw text as its own summary
-                                 (db/log-event! ctx
-                                   {:type      "warning"
-                                    :content   (str "batch summarization failed for blob " blob-id
-                                                    " — using raw text as summary")
-                                    :session-id (:session-id ctx)})
-                                 raw-chunks))]
-              (doseq [[[i chunk] summary] (map vector new-batch summaries)]
-                (let [vec (unwrap! (embedder/embed ctx summary))]
-                  (unwrap! (db/save-chunk! ctx
-                             {:blob-id blob-id
-                              :offset  i
-                              :vector  vec
-                              :summary summary
-                              :content chunk}))))))))
+                                 ;; fallback: use raw text as its own summary.
+                                 (try
+                                   (audit/log! ctx
+                                     {:type "system.warning"
+                                      :content (str "batch summarization failed for blob "
+                                                    blob-id " — using raw text as summary")})
+                                   (catch Exception _ nil))
+                                 raw-chunks))
+                  ;; Embed BEFORE the write thunk so HTTP latency does not
+                  ;; serialize the writer queue.
+                  rows (mapv (fn [[i chunk] summary]
+                               {:id      (str "chunk/" blob-id "/" i)
+                                :offset  i
+                                :vector  (unwrap! (embedder/embed ctx summary))
+                                :summary summary
+                                :content chunk})
+                             new-batch summaries)]
+              (kg/write!
+                (fn []
+                  (let [conn (:db-conn ctx)]
+                    (doseq [{:keys [id offset vector summary content]} rows]
+                      (kg/exec! conn "DELETE FROM chunks WHERE id = ?" id)
+                      (kg/exec! conn
+                                (str "INSERT INTO chunks
+                                       (id, blob_id, chunk_offset, vector, summary, content)
+                                       VALUES (?, ?, ?, " (vec->sql-literal vector) ", ?, ?)")
+                                id blob-id offset summary content)))))))))
       blob-id)))
 
 (defn index!
-  "Convenience: ingest + chunk in one call. Returns blob-id."
+  "Convenience: ingest + chunk in one call. Returns blob-id.
+
+   v2 note: KG `file`/`chunk` entity creation deferred to future
+   `loom.ingest`. Callers that need entities should `kg/upsert-entity!`
+   themselves with `:kind \"file\"` and link via DEFINED_IN."
   [ctx payload opts]
   (with-provenance "loom.blob/index!" 1
     (let [blob-id (unwrap! (ingest! ctx payload opts))]
       (chunk! ctx blob-id)
-      (let [source     (or (:source opts) "unknown")
-            entity-kind (if (re-find #"^https?://" source) "external" "file")
-            source-entity-id (str "source/" (sha256 (.getBytes source "UTF-8")))]
-        (unwrap! (graph/upsert-entity! ctx
-                  {:id              blob-id
-                   :canonical_name  source
-                   :kind            entity-kind
-                   :aliases         [source]
-                   :attrs           {:blob_id blob-id}
-                   :confidence      1.0
-                   :source_count    1
-                   :source_sessions [(:session-id ctx)]}
-                  {:scope :global}))
-        (unwrap! (graph/upsert-entity! ctx
-                  {:id              source-entity-id
-                   :canonical_name  source
-                   :kind            entity-kind
-                   :aliases         [source]
-                   :attrs           {}
-                   :confidence      1.0
-                   :source_count    1
-                   :source_sessions [(:session-id ctx)]}
-                  {:scope :global}))
-        (unwrap! (graph/upsert-relation! ctx
-                  {:subject_id      blob-id
-                   :predicate       "DEFINED_IN"
-                   :object_id       source-entity-id
-                   :confidence      1.0
-                   :source_id       blob-id
-                   :source_table    "blobs"
-                   :source_sessions [(:session-id ctx)]}
-                  {:scope :global}))
-        (let [chunks (unwrap! (db/list-chunks-by-blob ctx blob-id))]
-          (doseq [c chunks]
-            (let [chunk-id (:id c)
-                  summary  (or (:summary c) (str "chunk-" (:chunk_offset c)))
-                  chunk-entity-id (str "chunk/" chunk-id)]
-              (unwrap! (graph/upsert-entity! ctx
-                        {:id              chunk-entity-id
-                         :canonical_name  summary
-                         :kind            "concept"
-                         :aliases         [summary]
-                         :attrs           {:chunk_id chunk-id
-                                           :blob_id blob-id
-                                           :chunk_offset (:chunk_offset c)}
-                         :vector          (:vector c)
-                         :confidence      1.0
-                         :source_count    1
-                         :source_sessions [(:session-id ctx)]}
-                        {:scope :global}))
-              (unwrap! (graph/upsert-relation! ctx
-                        {:subject_id      chunk-entity-id
-                         :predicate       "MENTIONED_IN"
-                         :object_id       blob-id
-                         :confidence      1.0
-                         :source_id       chunk-id
-                         :source_table    "chunks"
-                         :source_sessions [(:session-id ctx)]}
-                        {:scope :global}))))))
       blob-id)))

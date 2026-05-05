@@ -1,17 +1,71 @@
 (ns loom.scratch
-  "Session-scoped scratch tool lifecycle.
-   Scratch tools live in ./scratch/<name>.clj, are loaded at session start,
-   tracked by hit count in the session parquet, and can be promoted to a
-   permanent loom.seed.<domain> namespace.
-   Nothing is deleted — forgotten session parquets persist in .loom/sessions/."
+  "In-flight scratch tool lifecycle.
+   Scratch tools live in ./scratch/<name>.clj, are loaded at boot, tracked
+   by global hit count, and can be promoted to a permanent
+   loom.seed.<domain> namespace.
+
+   v2 (architecture.md): scratch_tools and hits live in the file-backed
+   .loom/loom.db. No session_id partition: scratch tools are uniquely
+   identified by `name`; hits accumulate over project history."
   (:require [clojure.java.io :as io]
             [clojure.string :as str]
-            [loom.db :as db]
+            [cheshire.core :as json]
+            [loom.kg :as kg]
             [loom.embedder :as embedder]
             [loom.tools :as tools]
             [loom.envelope :refer [with-provenance unwrap!]]))
 
 (def ^:private hit-threshold 5)
+
+;; ---------------------------------------------------------------------------
+;; SQL helpers — DELETE+INSERT for FLOAT[768], shared with tools.clj/blob.clj
+;; ---------------------------------------------------------------------------
+
+(defn- vec->sql-literal [v]
+  (when (and v (seq v))
+    (str "[" (str/join ", " (map float v)) "]::FLOAT[768]")))
+
+(defn- save-scratch-row!
+  "Write (or replace) a scratch_tools row inside one kg/write! thunk.
+   Deterministic id: scratch/<name>."
+  [ctx {:keys [name doc tags vector code file]}]
+  (kg/write!
+    (fn []
+      (let [conn (:db-conn ctx)
+            id   (str "scratch/" name)
+            tags-json (json/encode (or tags []))
+            vec-frag  (vec->sql-literal vector)]
+        (kg/exec! conn "DELETE FROM scratch_tools WHERE id = ?" id)
+        (kg/exec! conn
+                  (str "INSERT INTO scratch_tools
+                          (id, name, doc, tags, vector, code, file)
+                          VALUES (?, ?, ?, ?, " (or vec-frag "NULL") ", ?, ?)")
+                  id name doc tags-json code file)
+        id))))
+
+(defn- get-scratch-row
+  "Fetch a scratch_tools row by full tool name. Returns map or nil."
+  [ctx tool-name]
+  (first (kg/query (:db-conn ctx)
+                   "SELECT id, name, doc, tags, code, file
+                      FROM scratch_tools
+                     WHERE name = ? AND retired = false"
+                   tool-name)))
+
+(defn- inc-hit!
+  "Atomically increment the global hit counter for tool-name. Returns the
+   new count."
+  [ctx tool-name]
+  (kg/write!
+    (fn []
+      (let [conn (:db-conn ctx)]
+        (kg/exec! conn
+                  "INSERT INTO hits (tool_name, count) VALUES (?, 1)
+                   ON CONFLICT (tool_name) DO UPDATE
+                     SET count = hits.count + 1"
+                  tool-name)
+        (-> (kg/query conn "SELECT count FROM hits WHERE tool_name = ?" tool-name)
+            first :count int)))))
 
 ;; ---------------------------------------------------------------------------
 ;; Scratch dir
@@ -63,13 +117,13 @@
                                                  {:sym var-sym})))
             text     (str/join " " [ns-name fn-name doc (str/join " " tags)])
             vec      (unwrap! (embedder/embed ctx text))]
-        (unwrap! (db/save-scratch-tool! ctx
-                   {:name  (str ns-name "/" fn-name)
-                    :doc   doc
-                    :tags  tags
-                    :vector vec
-                    :code  full-code
-                    :file  file}))
+        (save-scratch-row! ctx
+          {:name  (str ns-name "/" fn-name)
+           :doc   doc
+           :tags  tags
+           :vector vec
+           :code  full-code
+           :file  file})
         ;; also put in state mirror for in-process lookup
         (loom.state/add-tool! {:name   (str ns-name "/" fn-name)
                                :doc    doc
@@ -106,13 +160,13 @@
                           tags (or (:tags m) [])
                           text (str/join " " [ns-name fn-name doc (str/join " " tags)])
                           vec  (unwrap! (embedder/embed ctx text))]
-                      (unwrap! (db/save-scratch-tool! ctx
-                                 {:name  (str ns-name "/" fn-name)
-                                  :doc   doc
-                                  :tags  tags
-                                  :vector vec
-                                  :code  (slurp f)
-                                  :file  (.getAbsolutePath f)}))
+                      (save-scratch-row! ctx
+                        {:name  (str ns-name "/" fn-name)
+                         :doc   doc
+                         :tags  tags
+                         :vector vec
+                         :code  (slurp f)
+                         :file  (.getAbsolutePath f)})
                       (loom.state/add-tool! {:name   (str ns-name "/" fn-name)
                                              :doc    doc
                                              :tags   tags
@@ -127,11 +181,11 @@
 ;; ---------------------------------------------------------------------------
 
 (defn track-hit!
-  "Increment the session hit count for a scratch tool name.
+  "Increment the global hit count for a scratch tool name.
    Returns {:count n :promote? true} at threshold, {:count n} otherwise."
   [ctx tool-name]
   (with-provenance "loom.scratch/track-hit!" 1
-    (let [n (unwrap! (db/inc-hit! ctx tool-name))]
+    (let [n (inc-hit! ctx tool-name)]
       (if (= n hit-threshold)
         {:count n :promote? true
          :message (str "Scratch tool '" tool-name "' hit " n " uses. "
@@ -158,7 +212,7 @@
    the tool in the global parquet. Session parquet is left untouched."
   [ctx tool-name domain]
   (with-provenance "loom.scratch/promote!" 1
-    (let [scratch-rec (unwrap! (db/get-scratch-tool ctx tool-name))
+    (let [scratch-rec (get-scratch-row ctx tool-name)
           _           (when-not scratch-rec
                         (throw (ex-info "Scratch tool not found" {:name tool-name})))
           slug        (-> tool-name (str/split #"/") last)

@@ -1,6 +1,6 @@
 ---
 name: loom
-description: How to connect to Loom (semantic memory + tool registry), call its API over nREPL, and correctly unwrap envelope results. Load this before any Loom operation.
+description: How to connect to Loom (project-scoped knowledge graph + tool registry + RAG + audit log) and call its v2 API over nREPL. Load this before any Loom operation.
 compatibility: opencode
 ---
 
@@ -13,11 +13,10 @@ python3 ~/Projects/loom/loom_eval.py '<clojure expr>'
 ```
 
 Already available in the nREPL namespace — do not require:
+
 - `unwrap!`, `ok?` — from `loom.envelope`
 - `ctx` — the Loom context
-- `db`, `session`, `memory`, `tools`, `embedder`, `blob`, `init` — all aliased
-
----
+- `kg`, `tools`, `blob`, `audit`, `embedder`, `scratch`, `init` — aliased
 
 ## Check / start nREPL
 
@@ -26,6 +25,7 @@ nc -z localhost 7888 2>&1 && echo "running" || echo "not running"
 ```
 
 If not running:
+
 ```bash
 tmux new-session -d -s loom -c ~/Projects/loom 'clojure -M:dev' 2>/dev/null || true
 for i in $(seq 1 40); do nc -z localhost 7888 2>/dev/null && echo "nREPL ready" && break || sleep 1; done
@@ -33,150 +33,90 @@ for i in $(seq 1 40); do nc -z localhost 7888 2>/dev/null && echo "nREPL ready" 
 
 ---
 
-## Named helpers
+## What's persisted, what's not
 
-Use these instead of writing raw Loom calls. Each expands to the exact bash command to run.
+The KG is **authored** — by you (manual upsert) or by future ingestion pipelines. Agents read; they don't write knowledge from chatter. Subagent outputs (findings, plans, verdicts) flow back via tool responses, **not** persisted. The audit log is narrow: governance + tracing only.
 
-### loom/search
+| Persisted | Not persisted |
+|---|---|
+| `entities`, `relations`, `tools`, `scratch_tools`, `blobs`, `chunks`, `audit`, `usage` | findings, conclusions, approvals, rejections, failures, goals |
 
-Search session memory, tools, facts, and chunks for a query.
+---
+
+## Read helpers
+
+### loom/query-entities
+
+Filter precedence: `:vector` → ORDER BY distance, `:name-prefix` → ORDER BY name, `:ids` → batch get, none → ORDER BY updated_at DESC. `:kind` and `:limit` always apply.
 
 ```bash
-# Session memory (no embed needed)
-python3 ~/Projects/loom/loom_eval.py '(unwrap! (session/search-facts ctx "QUERY" 5))'
+# semantic
+python3 ~/Projects/loom/loom_eval.py '(let [v (unwrap! (embedder/embed ctx "QUERY"))]
+  (unwrap! (kg/query-entities ctx {:vector v :kind "concept" :limit 5})))'
 
-# Tools
-python3 ~/Projects/loom/loom_eval.py '(let [q (unwrap! (embedder/embed ctx "QUERY"))] (unwrap! (db/search-tools ctx q 5)))'
+# name prefix
+python3 ~/Projects/loom/loom_eval.py '(unwrap! (kg/query-entities ctx {:name-prefix "User" :kind "business_entity"}))'
 
-# Global facts
-python3 ~/Projects/loom/loom_eval.py '(let [q (unwrap! (embedder/embed ctx "QUERY"))] (unwrap! (db/search-facts ctx q 5)))'
+# batch get by id
+python3 ~/Projects/loom/loom_eval.py '(unwrap! (kg/query-entities ctx {:ids ["concept/foo" "concept/bar"]}))'
+```
 
-# Source chunks
-python3 ~/Projects/loom/loom_eval.py '(let [q (unwrap! (embedder/embed ctx "QUERY"))] (unwrap! (db/search-chunks ctx q 5)))'
+### loom/query-relations
 
-# Events (findings, conclusions, approvals)
-python3 ~/Projects/loom/loom_eval.py '(let [q (unwrap! (embedder/embed ctx "QUERY"))] (unwrap! (db/search-events ctx q 10)))'
+```bash
+python3 ~/Projects/loom/loom_eval.py '(unwrap! (kg/query-relations ctx {:subject-id "tool/loom.seed.fs/read-file" :predicate "USES"}))'
+```
+
+### loom/neighbors
+
+```bash
+python3 ~/Projects/loom/loom_eval.py '(unwrap! (kg/neighbors ctx "concept/foo" {:direction :out :predicates ["IMPLEMENTS"]}))'
+```
+
+### loom/search-tools
+
+```bash
+python3 ~/Projects/loom/loom_eval.py '(let [v (unwrap! (embedder/embed ctx "parse csv"))]
+  (unwrap! (kg/query-entities ctx {:vector v :kind "tool" :limit 5})))'
+```
+
+### loom/search-chunks
+
+```bash
+python3 ~/Projects/loom/loom_eval.py '(let [v (unwrap! (embedder/embed ctx "QUERY"))]
+  (unwrap! (loom.seed.db/search-chunks ctx "QUERY")))'
 ```
 
 ---
 
-### loom/log-fact!
+## Write helpers (rare; agents normally read only)
 
-Write a discovery to session memory.
+### loom/ingest-document!
 
-```bash
-python3 ~/Projects/loom/loom_eval.py '(unwrap! (session/log-fact! ctx "FACT"))'
-```
-
----
-
-### loom/promote!
-
-Promote a stable fact to global memory (persists across sessions).
+Ingest a markdown / plain-text file into the project KG. Idempotent — re-running on the same content rewrites the same rows. Creates: 1 `kind="file"` entity (with vector embedded from title), N `kind="concept"` entities (one per chunk), N `PART_OF` relations (concept → file), N rows in `chunks`.
 
 ```bash
-python3 ~/Projects/loom/loom_eval.py '(unwrap! (memory/promote! ctx "FACT" {:tags ["TAG"] :type :stable}))'
+python3 ~/Projects/loom/loom_eval.py '(unwrap! (loom.ingest/ingest-document! ctx "docs/spec.md" {:project "loom" :tags ["spec"]}))'
 ```
 
----
+Optional opts: `:title` (override), `:as` (`:doc` / `:business-model` — recorded in attrs), `:max-chunk-chars` (default 1000), `:min-chunk-chars` (default 50), `:heading-depth` (default 4).
 
-### loom/log-finding!
+Reserved (throws if used): `:parallel?`, `:batch-size`, `:llm-extract?` — wired in v2.
 
-Log a finding event (call after each major discovery).
+### loom/upsert-entity!
+
+Use only for explicit user-authored entities. Deterministic ids preferred.
 
 ```bash
-python3 ~/Projects/loom/loom_eval.py '(db/log-event! ctx {:type "finding" :content "CONTENT" :session-id (:session-id ctx) :agent-id "AGENT_ID" :goal-id "GOAL_ID"})'
+python3 ~/Projects/loom/loom_eval.py '(unwrap! (kg/upsert-entity! ctx
+  {:id "concept/payment-flow"
+   :kind "concept"
+   :canonical_name "Payment Flow"
+   :attrs {:source "manual"}
+   :vector (unwrap! (embedder/embed ctx "Payment Flow"))}))'
 ```
-
-Omit `:goal-id` if no active goal.
-
----
-
-### loom/log-conclusion!
-
-Log a conclusion event.
-
-```bash
-python3 ~/Projects/loom/loom_eval.py '(db/log-event! ctx {:type "conclusion" :content "CONTENT" :session-id (:session-id ctx) :agent-id "loom" :goal-id "GOAL_ID"})'
-```
-
----
-
-### loom/log-approval!
-
-Log a reviewer approval.
-
-```bash
-python3 ~/Projects/loom/loom_eval.py '(db/log-event! ctx {:type "approval" :content "CONTENT" :session-id (:session-id ctx) :agent-id "reviewer" :goal-id "GOAL_ID"})'
-```
-
----
-
-### loom/log-rejection!
-
-Log a reviewer rejection.
-
-```bash
-python3 ~/Projects/loom/loom_eval.py '(db/log-event! ctx {:type "rejection" :content "CONTENT" :session-id (:session-id ctx) :agent-id "reviewer" :goal-id "GOAL_ID"})'
-```
-
----
-
-### loom/log-failure!
-
-Log a task failure event (use before retrying a failed subagent task).
-
-```bash
-python3 ~/Projects/loom/loom_eval.py '(db/log-event! ctx {:type "failure" :content "CONTENT" :session-id (:session-id ctx) :agent-id "AGENT_ID" :goal-id "GOAL_ID"})'
-```
-
-Omit `:goal-id` if no active goal.
-
----
-
-### loom/active-goal
-
-Get the current active goal (returns nil if none).
-
-```bash
-python3 ~/Projects/loom/loom_eval.py '(unwrap! (loom.goals/active ctx))'
-```
-
----
-
-### loom/create-goal!
-
-Create a parent goal and return its id into `gid`.
-
-```bash
-python3 ~/Projects/loom/loom_eval.py '(def gid (unwrap! (loom.goals/create-goal! ctx {:title "TITLE" :description "DESCRIPTION" :status "active"})))'
-```
-
----
-
-### loom/create-subgoal!
-
-Create a sub-goal linked to a parent.
-
-```bash
-python3 ~/Projects/loom/loom_eval.py '(unwrap! (loom.goals/create-goal! ctx {:title "TITLE" :parent-id gid :status "open"}))'
-```
-
----
-
-### loom/close-goal!
-
-Mark a goal done.
-
-```bash
-python3 ~/Projects/loom/loom_eval.py '(unwrap! (loom.goals/update-status! ctx gid "done"))'
-```
-
----
 
 ### loom/register-tool!
-
-Define and register a new reusable tool.
 
 ```bash
 python3 ~/Projects/loom/loom_eval.py '
@@ -184,8 +124,30 @@ python3 ~/Projects/loom/loom_eval.py '
   TOOL_NAME [ctx ARG]
   (loom.envelope/with-provenance "TOOL_NAME" 1
     BODY))
-(unwrap! (tools/register! ctx #'"'"'TOOL_NAME))
-'
+(unwrap! (tools/register! ctx (quote user/TOOL_NAME)))'
+```
+
+---
+
+## Audit log
+
+Narrow types only — `^(guard|system|agent)\.…`. Never use for findings/conclusions.
+
+### loom/audit-log
+
+```bash
+# system warning
+python3 ~/Projects/loom/loom_eval.py '(unwrap! (audit/log! ctx {:type "system.warning" :content "MESSAGE"}))'
+
+# agent tracing (orchestrator only — see loom.md)
+python3 ~/Projects/loom/loom_eval.py '(unwrap! (audit/log! ctx {:type "agent.start" :agent-id "analyzer" :content "task X"}))'
+```
+
+### loom/audit-query
+
+```bash
+# recent guard denials
+python3 ~/Projects/loom/loom_eval.py '(unwrap! (audit/query ctx {:type-prefix "guard." :limit 50}))'
 ```
 
 ---

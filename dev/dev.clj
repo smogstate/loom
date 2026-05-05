@@ -1,13 +1,11 @@
 (ns dev
   "REPL convenience namespace. Starts loom and binds ctx."
   (:require [loom.core :as loom]
-            [loom.db :as db]
-            [loom.graph :as graph]
-            [loom.embedder :as embedder]
+            [loom.kg :as kg]
+            [loom.audit :as audit]
             [loom.tools :as tools]
-            [loom.session :as session]
-            [loom.memory :as memory]
             [loom.blob :as blob]
+            [loom.embedder :as embedder]
             [loom.envelope :refer [unwrap!]]))
 
 (defonce ctx (atom nil))
@@ -21,16 +19,20 @@
   ;; Start loom
   (start!)
 
-  ;; Search tools
-  (db/search-tools @ctx (unwrap! (embedder/embed @ctx "compound interest")) 3)
+  ;; Search tools (semantic)
+  (let [v (unwrap! (embedder/embed @ctx "compound interest"))]
+    (unwrap! (kg/query-entities @ctx {:vector v :kind "tool" :limit 3})))
 
-  ;; Run a task
-  (router/route! @ctx "list all math tools")
+  ;; Search concepts by name
+  (unwrap! (kg/query-entities @ctx {:name-prefix "User" :kind "concept"}))
 
-  ;; Log a session fact
-  (session/log-fact! @ctx "service runs on port 8080")
+  ;; Author a project-model entity
+  (let [v (unwrap! (embedder/embed @ctx "Payment Flow"))]
+    (unwrap! (kg/upsert-entity! @ctx
+              {:id "concept/payment-flow"
+               :kind "concept"
+               :canonical_name "Payment Flow"
+               :vector v})))
 
-  ;; Promote a fact
-  (memory/promote! @ctx "service runs on port 8080"
-    {:type :stable :tags ["service" "config"]})
-  )
+  ;; Audit log query (governance / tracing)
+  (unwrap! (audit/query @ctx {:type-prefix "guard." :limit 50})))

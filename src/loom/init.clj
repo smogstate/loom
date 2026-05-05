@@ -1,10 +1,14 @@
 (ns loom.init
   "Project initialization — walk current directory, ingest key files into Loom.
    No LLM required: files are split by size and embedded directly.
-   Run via the /loom-init OpenCode command or call (loom.init/run! ctx) from nREPL."
+   Run via the /loom-init OpenCode command or call (loom.init/run! ctx) from nREPL.
+
+   v2 (architecture.md): writes go to the file-backed chunks table.
+   TODO: this overlaps with the future loom.ingest pipeline; once that
+   lands, init should either delegate to ingest or be deleted."
   (:require [clojure.java.io :as io]
             [clojure.string :as str]
-            [loom.db :as db]
+            [loom.kg :as kg]
             [loom.embedder :as embedder]
             [loom.envelope :refer [with-provenance unwrap!]]))
 
@@ -74,22 +78,38 @@
 ;; Ingest one file
 ;; ---------------------------------------------------------------------------
 
+(defn- vec->sql-literal [v]
+  (when (and v (seq v))
+    (str "[" (str/join ", " (map float v)) "]::FLOAT[768]")))
+
 (defn- ingest-file! [ctx ^java.io.File f root-path]
   (let [rel-path (str/replace (.getAbsolutePath f)
                                (str root-path "/") "")
         text     (slurp f)
-        chunks   (line-chunks text)]
-    (doseq [[i chunk] (map-indexed vector chunks)]
-      (let [label (if (> (count chunks) 1)
-                    (str rel-path " [" (inc i) "/" (count chunks) "]")
-                    rel-path)
-            vec   (unwrap! (embedder/embed ctx label))]
-        (unwrap! (db/save-chunk! ctx
-                   {:blob-id  rel-path
-                    :offset   i
-                    :vector   vec
-                    :summary  label
-                    :content  chunk}))))
+        chunks   (line-chunks text)
+        ;; embed each chunk before entering the write thunk so HTTP latency
+        ;; doesn't serialize the writer queue.
+        rows     (mapv (fn [[i chunk]]
+                         (let [label (if (> (count chunks) 1)
+                                       (str rel-path " [" (inc i) "/" (count chunks) "]")
+                                       rel-path)]
+                           {:id      (str "chunk/" rel-path "/" i)
+                            :blob_id rel-path
+                            :offset  i
+                            :vector  (unwrap! (embedder/embed ctx label))
+                            :summary label
+                            :content chunk}))
+                       (map-indexed vector chunks))]
+    (kg/write!
+      (fn []
+        (let [conn (:db-conn ctx)]
+          (doseq [{:keys [id blob_id offset vector summary content]} rows]
+            (kg/exec! conn "DELETE FROM chunks WHERE id = ?" id)
+            (kg/exec! conn
+                      (str "INSERT INTO chunks
+                              (id, blob_id, chunk_offset, vector, summary, content)
+                              VALUES (?, ?, ?, " (vec->sql-literal vector) ", ?, ?)")
+                      id blob_id offset summary content)))))
     (count chunks)))
 
 ;; ---------------------------------------------------------------------------

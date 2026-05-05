@@ -1,8 +1,12 @@
 (ns loom.budget
   "Resource-aware optimization: per-agent budgets, usage recording, reporting.
    All agent tool calls should go through loom.budget/call to be metered.
-   Direct internal DB calls are not recorded — infrastructure, not agent actions."
-  (:require [loom.db :as db]
+   Direct internal DB calls are not recorded — infrastructure, not agent actions.
+
+   v2 (architecture.md §2): usage rows live in the attached `.loom/usage.db`
+   (schema `loom_usage.usage`). All reads/writes from this ns reference
+   that schema explicitly."
+            [loom.kg :as kg]
             [loom.envelope :refer [with-provenance]]
             [clojure.java.io :as io]
             [clojure.edn :as edn]
@@ -66,11 +70,25 @@
 (def ^:private batch-size 64)
 (def ^:private flush-interval-ms 5000)
 
-(defn- flush-pending! [ctx]
+(defn- flush-pending!
+  "Drain the in-memory ring and append rows to loom_usage.usage in one
+   write! thunk."
+  [ctx]
   (let [rows (first (reset-vals! pending-rows []))]
     (reset! first-pending-ts nil)
     (when (seq rows)
-      (db/save-usage-batch! ctx rows))))
+      (kg/write!
+        (fn []
+          (let [conn (:db-conn ctx)]
+            (doseq [r rows]
+              (kg/exec! conn
+                        "INSERT INTO loom_usage.usage
+                          (id, session_id, agent_id, op, version,
+                           duration_ms, ok, usd_cost, tokens_in, tokens_out)
+                          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                        (:id r) (:session_id r) (:agent_id r) (:op r) (:version r)
+                        (:duration_ms r) (:ok r) (:usd_cost r)
+                        (:tokens_in r) (:tokens_out r)))))))))
 
 (defn- maybe-flush! [ctx]
   (let [rows @pending-rows
@@ -155,14 +173,13 @@
   [ctx agent-id]
   (with-provenance "loom.budget/current-usage" 1
     (flush-pending! ctx)
-    (or (loom.envelope/unwrap!
-          (db/query-usage-scalar ctx
-            "SELECT SUM(usd_cost)    AS usd,
-                    SUM(duration_ms) AS duration_ms,
-                    COUNT(*)         AS calls
-             FROM usage
-             WHERE session_id = ? AND agent_id = ?"
-            (:session-id ctx) (or agent-id "")))
+    (or (first (kg/query (:db-conn ctx)
+                "SELECT SUM(usd_cost)    AS usd,
+                        SUM(duration_ms) AS duration_ms,
+                        COUNT(*)         AS calls
+                   FROM loom_usage.usage
+                  WHERE session_id = ? AND agent_id = ?"
+                (:session-id ctx) (or agent-id "")))
         {:usd 0.0 :duration_ms 0 :calls 0})))
 
 (defn enforce!
@@ -173,14 +190,14 @@
     (when agent-id
       ;; Flush pending so counts are up-to-date
       (flush-pending! ctx)
-      (let [u (loom.envelope/unwrap!
-                 (db/query-usage-scalar ctx
-                   "SELECT SUM(usd_cost)    AS usd,
-                           SUM(duration_ms) AS duration_ms,
-                           COUNT(*)         AS calls
-                    FROM usage
-                    WHERE session_id = ? AND agent_id = ?"
-                   (:session-id ctx) agent-id))
+      (let [u (or (first (kg/query (:db-conn ctx)
+                          "SELECT SUM(usd_cost)    AS usd,
+                                  SUM(duration_ms) AS duration_ms,
+                                  COUNT(*)         AS calls
+                             FROM loom_usage.usage
+                            WHERE session_id = ? AND agent_id = ?"
+                          (:session-id ctx) agent-id))
+                  {:usd 0.0 :duration_ms 0 :calls 0})
             cfg      (load-config* ctx)
             defaults (get-in cfg [:budgets :default] {:usd 1.00 :duration-ms 60000 :calls 1000})
             b        (merge defaults (get-in cfg [:budgets agent-id]))]
@@ -259,11 +276,11 @@
                           ", COUNT(*) AS calls"
                           ", SUM(usd_cost) AS usd"
                           ", SUM(duration_ms) AS duration_ms"
-                          " FROM usage "
+                          " FROM loom_usage.usage "
                           where-str
                           " GROUP BY " group-str
                           " ORDER BY usd DESC")]
-      (loom.envelope/unwrap! (apply db/query-usage-raw ctx sql params)))))
+      (apply kg/query (:db-conn ctx) sql params))))
 
 ;; ---------------------------------------------------------------------------
 ;; Periodic flush loop + init

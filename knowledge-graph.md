@@ -1,6 +1,6 @@
 # Loom Knowledge Graph Plan
 
-**Status:** FINAL (review-ready)
+**Status:** SUPERSEDED by `plans/architecture.md` (2026-05-04)
 **Author:** OpenCode
 **Date:** 2026-05-03
 **Goal ID:** `601b99ed-30e4-4621-8c9b-8e4de0a91f9f`

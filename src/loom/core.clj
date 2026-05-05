@@ -1,6 +1,6 @@
 (ns loom.core
   "Entry point. Builds ctx, bootstraps DB, starts nREPL for external agents."
-  (:require [loom.db :as db]
+  (:require [loom.kg :as kg]
             [loom.embedder :as embedder]
             [loom.state :as state]
             [loom.tools :as tools]
@@ -24,16 +24,15 @@
                         :strong "claude-sonnet-4-5"}}}]
    (let [sid      (or session-id (str (java.util.UUID/randomUUID)))
          loom-dir (-> (io/file loom-dir) .getAbsolutePath)
-         conn     (db/connect!)]
-     ;; ensure dirs
-     (.mkdirs (io/file loom-dir "sessions" sid))
-     (db/start-writer!)
-    {:conn           conn
-     :embedder       (fn [text] (embedder/embed {:config {:ollama-url ollama-url}} text))
-     :state          state/session-state
-     :session-id     sid
-     :promotion-mode (atom :off)
-     :config         {:models     models
+         db-conn  (kg/connect-file! loom-dir)
+         _        (kg/init-schema! db-conn)]
+     (.mkdirs (io/file loom-dir))
+     (kg/start-writer!)
+     {:db-conn    db-conn
+      :embedder   (fn [text] (embedder/embed {:config {:ollama-url ollama-url}} text))
+      :state      state/session-state
+      :session-id sid
+      :config     {:models     models
                    :ollama-url ollama-url
                    :loom-dir   loom-dir
                    :max-turns  20}})))
@@ -45,8 +44,7 @@
 (def ^:private seed-namespaces
   '[loom.seed.http loom.seed.fs loom.seed.text
     loom.seed.data loom.seed.math loom.seed.db
-    loom.seed.project loom.seed.eval
-    loom.goals])
+    loom.seed.eval])
 
 (defn bootstrap!
   "Seed the tool library. Registers any seed tool not yet in the DB."
@@ -54,21 +52,25 @@
   (println "[loom] Bootstrapping tool library...")
   (doseq [ns-sym seed-namespaces]
     (tools/scan-ns! ctx ns-sym))
-  (println (str "[loom] Tools ready: " (unwrap! (db/table-count ctx :tools)) " total.")))
+  (let [n (-> (kg/query (:db-conn ctx) "SELECT count(*) AS c FROM tools")
+              first :c int)]
+    (println (str "[loom] Tools ready: " n " total."))))
 
 ;; ---------------------------------------------------------------------------
 ;; Session start — ingest LOOM.md if present
 ;; ---------------------------------------------------------------------------
 
 (defn maybe-ingest-loom-md!
-  "If LOOM.md exists in the current directory, ingest it."
+  "If LOOM.md exists in the current directory, ingest it via loom.ingest."
   [ctx]
   (let [f (java.io.File. "LOOM.md")]
     (when (.exists f)
-      (println "[loom] LOOM.md found — ingesting project facts...")
-      (require 'loom.seed.project)
-      ((resolve 'loom.seed.project/ingest-project-md!)
-       ctx "LOOM.md" {:project (.getName (java.io.File. "."))}))))
+      (println "[loom] LOOM.md found — ingesting into project KG...")
+      (require 'loom.ingest)
+      ((resolve 'loom.ingest/ingest-document!)
+       ctx "LOOM.md" {:project (.getName (java.io.File. "."))
+                      :as :doc
+                      :tags ["loom.md"]}))))
 
 ;; ---------------------------------------------------------------------------
 ;; Public start fn
@@ -85,7 +87,6 @@
      ((resolve 'loom.budget/init!) ctx)
      (scratch/load-all! ctx)
      (maybe-ingest-loom-md! ctx)
-     (tools/start-watcher! ctx)
      (repl/start!)
      (println "[loom] Ready.")
      ctx)))
